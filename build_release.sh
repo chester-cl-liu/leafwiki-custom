@@ -1,8 +1,23 @@
 #!/bin/bash
+# 遇到任何命令出错立即停止执行
+set -e
+
 MODULE_NAME="leafwiki"
 VERSION="0.10.2-custom"
 BUILD_DIR="releases_dist"
 
+# ==== 1. 前端自动化打包与资源同步 ====
+echo "正在构建前端静态资源..."
+cd ui/leafwiki-ui
+pnpm install
+pnpm build
+cd ../..
+
+echo "正在同步前端产物到 Go embed 目录..."
+rm -rf internal/http/dist
+cp -r ui/leafwiki-ui/dist internal/http/
+
+# ==== 2. 初始化构建目录 ====
 rm -rf $BUILD_DIR
 mkdir -p $BUILD_DIR
 
@@ -15,8 +30,15 @@ PLATFORMS=(
     "darwin/arm64"
 )
 
-echo "开始编译全套 Releases 版本: $VERSION..."
+# 核心注入参数：合并你原本的 -s -w 压缩，并强行开启前端内嵌
+LDFLAGS="-s -w -X 'github.com/perber/wiki/internal/http.EmbedFrontend=true' -X 'github.com/perber/wiki/internal/http.Environment=production'"
 
+echo "开始编译全套 满血版 Releases 版本: $VERSION..."
+
+# 获取当前绝对路径，方便打包时准确定位
+ROOT_DIR=$(pwd)
+
+# ==== 3. 跨平台循环编译 ====
 for PLATFORM in "${PLATFORMS[@]}"; do
     IFS="/" read -r -a arr <<< "$PLATFORM"
     GOOS="${arr[0]}"
@@ -29,18 +51,17 @@ for PLATFORM in "${PLATFORMS[@]}"; do
 
     echo "正在编译 -> OS: $GOOS, ARCH: $GOARCH..."
 
-    # 执行 Go 编译 (根据 leafwiki 实际入口调整路径，通常是 main.go 所在目录)
-    # CGO_ENABLED=0 确保静态链接，避免目标机器缺少 glibc 报错
-    CGO_ENABLED=0 GOOS=$GOOS GOARCH=$GOARCH go build -ldflags="-s -w" -o "${BUILD_DIR}/${OUTPUT_NAME}" ./cmd/leafwiki
+    # 执行 Go 编译，注入 LDFLAGS
+    CGO_ENABLED=0 GOOS=$GOOS GOARCH=$GOARCH go build -ldflags="${LDFLAGS}" -o "${BUILD_DIR}/${OUTPUT_NAME}" ./cmd/leafwiki
 
-    # 顺便打包成 tar.gz 或 zip
-    cd $BUILD_DIR
+    # 安全地进入构建目录打包，随后返回原目录
+    cd "${ROOT_DIR}/${BUILD_DIR}"
     if [ "$GOOS" = "windows" ]; then
-        zip "${OUTPUT_NAME}.zip" "${OUTPUT_NAME}" && rm "${OUTPUT_NAME}"
+        zip -q "${OUTPUT_NAME}.zip" "${OUTPUT_NAME}" && rm "${OUTPUT_NAME}"
     else
         tar -czf "${OUTPUT_NAME}.tar.gz" "${OUTPUT_NAME}" && rm "${OUTPUT_NAME}"
     fi
-    cd ..
+    cd "${ROOT_DIR}"
 done
 
 echo "所有平台编译完成，文件保存在 ./${BUILD_DIR} 目录中。"
