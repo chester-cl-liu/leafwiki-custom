@@ -1,6 +1,6 @@
 #!/bin/bash
 MODULE_NAME="leafwiki"
-VERSION="0.10.1-custom"
+VERSION="0.10.2-custom"
 BUILD_DIR="releases_dist"
 
 rm -rf $BUILD_DIR
