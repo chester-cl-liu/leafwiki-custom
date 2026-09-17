@@ -56,3 +56,4 @@ internal/http/dist/*
 /CLAUDE.md
 /AGENTS.md
 /.claude/
+releases_dist/
