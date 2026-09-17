@@ -3,7 +3,7 @@ import { createNavigationVisitState } from '@/lib/navigationVisit'
 import { buildEditUrl, buildHistoryUrl, buildViewUrl } from '@/lib/routePath'
 import { normalizeWikiRoutePath } from '@/lib/wikiPath'
 import { useTreeStore } from '@/stores/tree'
-import { NavigateFunction } from 'react-router-dom'
+import { NavigateFunction } from 'react-router'
 import { useLinkStatusStore } from '../links/linkstatus_store'
 import { useViewerStore } from '../viewer/viewer'
 
@@ -11,6 +11,10 @@ type RefreshAfterPageRefactorOptions = {
   preview: PageRefactorPreview
   currentPath: string
   navigate: NavigateFunction
+  // Tree reload variant to use (see useTreeStore.reloadTree). Callers that
+  // already show their own optimistic/loading state (e.g. tree drag-and-drop)
+  // pass true to avoid a second, non-silent tree reload flashing a spinner.
+  silentReload?: boolean
 }
 
 function normalizeRoutePath(path: string) {
@@ -47,8 +51,9 @@ export async function refreshAfterPageRefactor({
   preview,
   currentPath,
   navigate,
+  silentReload = false,
 }: RefreshAfterPageRefactorOptions) {
-  await useTreeStore.getState().reloadTree()
+  await useTreeStore.getState().reloadTree({ silent: silentReload })
 
   const currentViewerPage = useViewerStore.getState().page
   const normalizedViewerPath = normalizeWikiRoutePath(

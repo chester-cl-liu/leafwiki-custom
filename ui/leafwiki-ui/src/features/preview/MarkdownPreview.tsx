@@ -1,6 +1,9 @@
 import { useDesignModeStore } from '@/features/designtoggle/designmode'
+import i18next from '@/lib/i18n'
+import { preprocessWikilinks } from '@/lib/preprocessWikilinks'
 import { withBasePath } from '@/lib/routePath'
 import { useTreeStore } from '@/stores/tree'
+import 'katex/dist/katex.min.css'
 import {
   AnchorHTMLAttributes,
   AudioHTMLAttributes,
@@ -21,28 +24,34 @@ import {
   useState,
   useSyncExternalStore,
 } from 'react'
-import ReactMarkdown, { defaultUrlTransform } from 'react-markdown'
+import ReactMarkdown, {
+  defaultUrlTransform,
+  type ExtraProps,
+} from 'react-markdown'
 import { JSX } from 'react/jsx-runtime'
 import rehypeHighlight from 'rehype-highlight'
 import rehypeKatex from 'rehype-katex'
 import rehypeRaw from 'rehype-raw'
 import rehypeSanitize, { defaultSchema } from 'rehype-sanitize'
+import remarkFlexibleMarkers from 'remark-flexible-markers'
 import remarkGfm from 'remark-gfm'
 import remarkMath from 'remark-math'
 import { extractTocEntries } from './extractTocEntries'
-import { TocDropdownButton } from './TocDropdownButton'
 import Headline from './Headline'
 import MarkdownCodeBlock from './MarkdownCodeBlock'
+import MarkdownInlineCode from './MarkdownInlineCode'
 import { MarkdownImage } from './MarkdownImage'
 import { MarkdownLink } from './MarkdownLink'
 import './markdownPreviewCodeTheme.css'
 import MermaidBlock from './MermaidBlock'
 import { normalizeMarkdownListIndentation } from './normalizeMarkdownListIndentation'
-import { normalizeMarkdownShoutouts } from './normalizeMarkdownShoutouts'
-import { preprocessWikilinks } from '@/lib/preprocessWikilinks'
+import { normalizeMarkdownBlocks } from './normalizeMarkdownBlocks'
+import { rehypeCodeFenceLineNumbers } from './rehypeCodeFenceLineNumbers'
 import { rehypeLineNumber } from './rehypeLineNumber'
 import { rehypeWhitelistStyles } from './rehypeWhitelistStyles'
-import 'katex/dist/katex.min.css'
+import { syntaxHighlightLanguages } from './syntaxHighlightLanguages'
+import { TocDropdownButton } from './TocDropdownButton'
+import { remarkImageSize } from './remarkImageSize'
 
 const schema = {
   ...defaultSchema,
@@ -54,8 +63,9 @@ const schema = {
       'wikilink-notfound',
       'wikilink-ambiguous',
     ],
+    src: [...(defaultSchema.protocols?.src ?? []), 'http', 'https'],
   },
-  tagNames: [...(defaultSchema.tagNames || []), 'audio', 'video'],
+  tagNames: [...(defaultSchema.tagNames || []), 'audio', 'video', 'mark'],
   attributes: {
     ...defaultSchema.attributes,
     '*': [
@@ -64,7 +74,15 @@ const schema = {
       'className',
       'data-leafwiki-generated-id',
       'data-line',
+      'data-line-numbers',
       'style',
+    ],
+    code: [
+      ...(defaultSchema.attributes?.code || []),
+      'className',
+      'class',
+      'data-line',
+      'data-line-numbers',
     ],
     audio: [...(defaultSchema.attributes?.audio || []), 'controls', 'src'],
     video: [
@@ -97,9 +115,7 @@ const WIKILINK_PROTOCOLS = [
   'wikilink-ambiguous:',
 ] as const
 
-type MarkdownNodeProp = {
-  node?: unknown
-}
+type MarkdownNodeProp = ExtraProps
 
 type SemanticAlertKind = 'info' | 'success' | 'warning' | 'error'
 
@@ -192,7 +208,7 @@ class MarkdownPreviewErrorBoundary extends Component<
     if (this.state.hasError) {
       return (
         <div className="border-destructive/40 bg-destructive/5 text-destructive rounded-md border p-4 text-sm">
-          This page contains Markdown that could not be rendered safely.
+          {i18next.t('markdownPreview.renderError', { ns: 'viewer' })}
         </div>
       )
     }
@@ -312,11 +328,10 @@ export default function MarkdownPreview({
         node,
         ...props
       }: MarkdownNodeProp &
-        JSX.IntrinsicAttributes &
         ClassAttributes<HTMLImageElement> &
         HTMLAttributes<HTMLImageElement>) => {
         void node
-        return <MarkdownImage resolveAssetUrl={resolveAssetUrl} {...props} />
+        return <MarkdownImage {...props} resolveAssetUrl={resolveAssetUrl} />
       },
       audio: ({
         node,
@@ -528,7 +543,10 @@ export default function MarkdownPreview({
       }: MarkdownNodeProp &
         JSX.IntrinsicAttributes &
         ClassAttributes<HTMLElement> &
-        HTMLAttributes<HTMLElement> & { 'data-line'?: string }) => {
+        HTMLAttributes<HTMLElement> & {
+          'data-line'?: string
+          'data-line-numbers'?: string | boolean
+        }) => {
         void node
         const { className, children, 'data-line': dataLine } = props
         if (className?.includes('language-mermaid')) {
@@ -557,9 +575,9 @@ export default function MarkdownPreview({
           return <code data-line={dataLine}>{children}</code>
         }
         return (
-          <code data-line={dataLine} className="inline-code">
+          <MarkdownInlineCode data-line={dataLine} className={className}>
             {children}
-          </code>
+          </MarkdownInlineCode>
         )
       },
     }),
@@ -569,7 +587,7 @@ export default function MarkdownPreview({
   const normalizedContent = useMemo(
     () =>
       normalizeMarkdownListIndentation(
-        normalizeMarkdownShoutouts(
+        normalizeMarkdownBlocks(
           preprocessWikilinks(content, (title) => {
             const lower = title.toLowerCase()
             return Object.values(treeById).filter(
@@ -606,27 +624,47 @@ export default function MarkdownPreview({
     return () => observer.disconnect()
   }, [showToc, tocEntries.length, onStickyTocChange])
 
-  const markdownBody = (
-    <MarkdownPreviewErrorBoundary resetKey={`${path ?? ''}:${content}`}>
-      <>
-        <ReactMarkdown
-          remarkPlugins={[remarkMath, remarkGfm]}
-          rehypePlugins={[
-            rehypeRaw,
-            rehypeLineNumber,
-            rehypeWhitelistStyles,
-            [rehypeKatex, { output: 'html', strict: 'ignore' }],
-            [rehypeSanitize, schema],
-            rehypeHighlight,
-          ]}
-          components={components}
-          urlTransform={transformMarkdownUrl}
-        >
-          {normalizedContent}
-        </ReactMarkdown>
-        <div id="mermaid-renderer"></div>
-      </>
-    </MarkdownPreviewErrorBoundary>
+  // Memoized on the resolved markdown string: tree updates (e.g. drag reorder
+  // in the sidebar) swap the store's byId identity on every change, and without
+  // this the whole remark/rehype pipeline would re-parse and re-render the
+  // article on each of those updates even though nothing in it changed.
+  const markdownBody = useMemo(
+    () => (
+      <MarkdownPreviewErrorBoundary resetKey={`${path ?? ''}:${content}`}>
+        <>
+          <ReactMarkdown
+            // singleDollarTextMath disabled: $var in bash/code prose would be parsed
+            // as math delimiters and conflict with wikilink preprocessing. Use $$...$$ for math.
+            remarkPlugins={[
+              [remarkMath, { singleDollarTextMath: false }],
+              remarkGfm,
+              remarkFlexibleMarkers,
+              remarkImageSize,
+            ]}
+            rehypePlugins={[
+              rehypeRaw,
+              rehypeLineNumber,
+              rehypeCodeFenceLineNumbers,
+              rehypeWhitelistStyles,
+              [rehypeKatex, { output: 'html', strict: 'ignore' }],
+              [rehypeSanitize, schema],
+              [
+                rehypeHighlight,
+                {
+                  languages: syntaxHighlightLanguages,
+                },
+              ],
+            ]}
+            components={components}
+            urlTransform={transformMarkdownUrl}
+          >
+            {normalizedContent}
+          </ReactMarkdown>
+          <div id="mermaid-renderer"></div>
+        </>
+      </MarkdownPreviewErrorBoundary>
+    ),
+    [normalizedContent, components, path, content],
   )
 
   if (!showToc || tocEntries.length <= 3) {

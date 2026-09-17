@@ -3,8 +3,7 @@ import { withBasePath } from '@/lib/routePath'
 import { useDialogsStore } from '@/stores/dialogs'
 import { useEffect, useMemo, useState } from 'react'
 
-type Props = React.ImgHTMLAttributes<HTMLImageElement> & { node?: unknown }
-type MarkdownImageProps = Omit<Props, 'node'> & {
+type MarkdownImageProps = React.ImgHTMLAttributes<HTMLImageElement> & {
   resolveAssetUrl?: (src: string) => string
 }
 
@@ -34,11 +33,10 @@ export function MarkdownImage({
   src = '',
   style,
   alt,
-  node,
+  width,
   resolveAssetUrl,
   ...rest
-}: MarkdownImageProps & { node?: unknown }) {
-  void node
+}: MarkdownImageProps) {
   const openDialog = useDialogsStore((s) => s.openDialog)
   const resolvedSrc = useMemo(
     () => resolveAssetUrl?.(src) ?? src,
@@ -74,13 +72,31 @@ export function MarkdownImage({
       src={versionedSrc}
       alt={alt}
       style={{
+        // Tailwind's preflight resets images to `display: block`, which forces
+        // a line break between an image and any text that follows it on the
+        // same Markdown line (`![alt](img) text`). Keep Markdown images inline
+        // so trailing/leading text stays on the same line (#1471).
+        display: 'inline-block',
         ...style,
         cursor: 'zoom-in',
+        ...(width
+          ? {
+              width,
+              height: 'auto',
+            }
+          : {}),
       }}
       draggable={false}
       {...rest}
       onClick={(e) => {
         rest.onClick?.(e)
+
+        // Images wrapped in a link (Markdown `[![alt](img)](url)` or raw
+        // `<a><img></a>`) should follow the link instead of opening the
+        // preview dialog.
+        if (e.currentTarget.closest('a')) {
+          return
+        }
 
         if (shouldOpenInNewTab(e)) {
           window.open(versionedSrc, '_blank', 'noopener,noreferrer')

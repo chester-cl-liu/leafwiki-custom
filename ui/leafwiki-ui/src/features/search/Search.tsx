@@ -14,6 +14,8 @@ import { deferStateUpdate } from '@/lib/deferState'
 import { normalizeWikiRoutePath } from '@/lib/wikiPath'
 import { fetchTags, TagCount } from '@/lib/api/tags'
 import { useDebounce } from '@/lib/useDebounce'
+import { getShortcutDefinition } from '@/lib/shortcuts/shortcutCatalog'
+import { useSidebarStore } from '@/stores/sidebar'
 import { X } from 'lucide-react'
 import {
   startTransition,
@@ -23,7 +25,7 @@ import {
   useRef,
   useState,
 } from 'react'
-import { useLocation, useNavigate, useSearchParams } from 'react-router-dom'
+import { useLocation, useNavigate, useSearchParams } from 'react-router'
 import SearchResultCard from './SearchResultCard'
 
 type SearchProps = {
@@ -32,6 +34,14 @@ type SearchProps = {
 
 const t = (key: string, opts?: Record<string, unknown>) =>
   i18next.t(key, { ...opts, ns: 'search' })
+
+// Sidebar panel switching must keep working while the search field is
+// focused, otherwise the shortcuts are only reachable from elsewhere on
+// the page (see HotKeyHandler's input/button focus guard).
+const SEARCH_INPUT_ALLOWED_HOTKEYS = [
+  getShortcutDefinition('sidebar.explorer.open').keyCombo,
+  getShortcutDefinition('sidebar.search.open').keyCombo,
+].join(' ')
 
 export default function Search({ active = false }: SearchProps) {
   const location = useLocation()
@@ -54,6 +64,9 @@ export default function Search({ active = false }: SearchProps) {
   const [availableTagsError, setAvailableTagsError] = useState(false)
   const [facetTags, setFacetTags] = useState<SearchTagFacet[]>([])
   const searchInputRef = useRef<HTMLInputElement | null>(null)
+  const searchFocusRequestId = useSidebarStore(
+    (state) => state.searchFocusRequestId,
+  )
   const resultRefs = useRef<(HTMLAnchorElement | null)[]>([])
   const latestRequestIdRef = useRef(0)
 
@@ -150,7 +163,9 @@ export default function Search({ active = false }: SearchProps) {
     if (active) {
       searchInputRef.current?.focus()
     }
-  }, [active])
+    // searchFocusRequestId is bumped when the search shortcut is pressed
+    // again while already active, to refocus the input on demand.
+  }, [active, searchFocusRequestId])
 
   useEffect(() => {
     if (!active) {
@@ -284,6 +299,7 @@ export default function Search({ active = false }: SearchProps) {
           placeholder={t('input.placeholder')}
           value={inputQuery}
           data-testid="search-input"
+          data-allow-hotkeys={SEARCH_INPUT_ALLOWED_HOTKEYS}
           onChange={(e) => {
             const nextQuery = e.target.value
             invalidatePendingRequests()

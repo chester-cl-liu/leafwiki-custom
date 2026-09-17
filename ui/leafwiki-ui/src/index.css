@@ -14,7 +14,9 @@
 ------------------------------------------------------- */
 @theme {
   /* Typography + Radii */
-  --font-sans: InterVariable, system-ui, sans-serif;
+  --font-sans:
+    InterVariable, system-ui, 'Segoe UI Emoji', 'Apple Color Emoji',
+    'Noto Color Emoji', sans-serif;
   --radius: 0.5rem;
   --radius-lg: 0.5rem;
   --radius-md: 0.375rem;
@@ -70,6 +72,7 @@
   --color-markdown-toolbar-text: hsl(var(--markdown-toolbar-text));
 
   --color-muted: hsl(var(--muted));
+  --color-muted-surface: hsl(var(--muted-surface));
   --color-muted-foreground: hsl(var(--muted-foreground));
   --color-table-header-bg: hsl(var(--table-header-bg));
   --color-table-header-border: hsl(var(--table-header-border));
@@ -151,7 +154,10 @@
     --markdown-toolbar-border: 214 32% 91%;
     --markdown-toolbar-text: 215 25% 27%;
 
+    /* --muted is a *text/icon* token (consumed via `text-muted`, `border-muted`).
+       `bg-*` surfaces use --muted-surface instead — see theme-tokens.test.ts. */
     --muted: 215 16% 47%;
+    --muted-surface: 210 40% 96%;
     --muted-foreground: 215 16% 47%;
 
     --headline-anchor-icon: 215 20% 65%;
@@ -228,8 +234,9 @@
     --markdown-toolbar-border: 220 14% 26%;
     --markdown-toolbar-text: 220 8% 78%;
 
-    /* ---- MUTED TEXT / ICONS ---- */
+    /* ---- MUTED TEXT / ICONS  (surface = --muted-surface) ---- */
     --muted: 220 10% 60%;
+    --muted-surface: 222 16% 18%;
     --muted-foreground: 220 10% 60%;
 
     --headline-anchor-icon: 220 12% 65%;
@@ -471,7 +478,7 @@
 
   /* App Layout */
   .app-layout__header {
-    @apply bg-surface fixed z-20 h-[55px] w-full border-b p-4;
+    @apply bg-surface fixed z-20 h-[55px] w-full overflow-hidden border-b p-4;
   }
 
   .app-layout__header-inner {
@@ -487,7 +494,7 @@
   }
 
   .app-layout__logo-n-title {
-    @apply mr-6 ml-6 flex min-h-full items-center gap-2;
+    @apply mr-6 ml-6 flex min-h-full min-w-0 shrink items-center gap-2 max-sm:mr-2 max-sm:ml-3;
   }
 
   .app-layout__logo-n-title h2 {
@@ -499,7 +506,7 @@
   }
 
   .app-layout__logo-image {
-    @apply inline-block h-16 w-auto max-w-32 shrink-0 object-contain align-middle;
+    @apply inline-block h-auto max-h-9 w-auto max-w-32 object-contain align-middle max-sm:max-w-24;
   }
 
   .app-layout__logo-emoji {
@@ -523,7 +530,11 @@
   }
 
   .app-layout__sidebar-container {
-    @apply relative z-30 box-border h-full overflow-auto pr-1 max-sm:fixed max-sm:h-[calc(100dvh-55px)];
+    @apply relative z-30 box-border h-full overflow-x-hidden overflow-y-auto pr-1 max-sm:fixed max-sm:h-[calc(100dvh-55px)];
+  }
+
+  .app-layout__sidebar-panel {
+    @apply h-full;
   }
 
   .app-layout__sidebar-container--flush {
@@ -531,7 +542,7 @@
   }
 
   .app-layout__sidebar-resizer {
-    @apply absolute inset-y-0 right-0 flex w-1 cursor-col-resize items-center justify-center;
+    @apply absolute inset-y-0 right-0 z-10 flex w-1 cursor-col-resize items-center justify-center;
   }
 
   .app-layout__sidebar-resize-handle {
@@ -551,19 +562,82 @@
   }
 
   .app-layout__main-content-area {
-    @apply flex flex-1 flex-col items-stretch transition-all duration-200;
+    @apply flex min-w-0 flex-1 flex-col items-stretch transition-all duration-200;
   }
 
   .app-layout__main-column {
-    @apply flex min-w-0 flex-1 flex-col;
+    @apply flex min-w-0 flex-1 flex-col overflow-hidden;
+  }
+
+  /* scroll container: flex row with toc pane — scrollbar at far right edge */
+  .app-layout__content-row {
+    @apply flex min-h-0 flex-1 overflow-y-auto;
   }
 
   .app-layout__subheader-root:empty {
     display: none;
   }
 
+  /* TOC right pane — hidden by default and when empty (no portal content).
+     Width shrinks to icon-only on collapse so the article actually reclaims
+     the reading width (not just a fixed-footprint content crossfade). The
+     subheader bar's matching padding-right (.page-viewer__subheader--toc-
+     reserved / --collapsed in the subheader rules below) transitions with
+     the exact same width/duration so it stays aligned with <main> at every
+     frame, not just at rest.
+
+     Stays `display: flex; width: 0` (not `display: none`) even when empty,
+     so the pane always has a real box to animate width from/to. Toggling
+     `display: none` <-> `flex` on mount/unmount of the portaled TocSidePanel
+     (e.g. navigating from a page with no TOC to one with a TOC) gives the
+     browser no previous width to transition from, so <main> would snap to
+     its narrower width in one frame while the subheader's padding-right
+     (which animates on an always-mounted node) still eased in over 200ms —
+     a visible desync between the two. Keeping a persistent 0-width flex box
+     here means that first appearance animates too, in lockstep. */
+  .app-layout__toc-pane {
+    display: none;
+  }
+
+  @media (min-width: 1280px) {
+    .app-layout__toc-pane {
+      display: flex;
+      flex-direction: column;
+      position: sticky;
+      top: 0;
+      align-self: flex-start;
+      width: 0;
+      flex-shrink: 0;
+      overflow: hidden;
+      /* Caps the panel to the height of #scroll-container (its sticky
+         containing block, itself bounded by .app-layout's viewport-derived
+         height) so it can never grow past the bottom of the window with
+         many headings. .page-viewer__toc-panel-list is the part that
+         actually scrolls once capped — see index.css further down. */
+      max-height: 100%;
+      transition: width 200ms ease;
+    }
+
+    .app-layout__toc-pane:not(:empty) {
+      width: 16rem;
+      padding-top: 1.5rem;
+    }
+
+    /* 3rem, not a rounder 2.5rem: the header needs pl-3 (12px) + border-l
+       (1px) + the toggle button (~22px) + its gap-2 (8px) to the title even
+       when the title has shrunk to 0 width — ~43px minimum. At 2.5rem
+       (40px) the header narrowly overflowed its own box right at the end of
+       the collapse animation, which made justify-between's space-between
+       fall back to packing from the start (no slack left to distribute),
+       causing the button to visibly jump a couple of px right at the tail
+       of the transition instead of staying flush against the right edge. */
+    .app-layout__toc-pane--collapsed:not(:empty) {
+      width: 3rem;
+    }
+  }
+
   .app-layout__main-content-area-viewer {
-    @apply border-surface-border overflow-auto;
+    @apply border-surface-border;
   }
 
   .app-layout__main-content-area-editor {
@@ -627,32 +701,32 @@
     @apply bg-primary/10 border-primary/30 text-interface-text rounded border px-2 py-1 text-xs shadow-sm;
   }
 
-  /* UserToolbar Component */
-  .user-toolbar {
+  /* UserMenu Component */
+  .user-menu {
     @apply ml-auto flex items-center gap-4;
   }
 
-  .user-toolbar__avatar {
+  .user-menu__avatar {
     @apply h-5 w-5 max-sm:h-7 max-sm:w-7;
   }
 
-  .user-toolbar__avatar > span {
+  .user-menu__avatar > span {
     @apply bg-avatar-bg! text-avatar-foreground!;
   }
 
-  .user-toolbar__avatar-fallback {
+  .user-menu__avatar-fallback {
     @apply text-muted-foreground font-medium;
   }
 
-  .user-toolbar__not-logged-in {
+  .user-menu__not-logged-in {
     @apply text-error text-sm;
   }
 
-  .user-toolbar__menu-item {
+  .user-menu__menu-item {
     @apply text-interface-text hover:bg-surface-alt cursor-pointer;
   }
 
-  .user-toolbar-dropdown-trigger {
+  .user-menu__dropdown-trigger {
     @apply flex items-center space-x-2 focus:outline-hidden;
   }
 
@@ -700,7 +774,7 @@
 
   /* AssetManager Component */
   .asset-manager {
-    @apply text-interface-text space-y-3 text-sm;
+    @apply text-interface-text min-w-0 space-y-3 text-sm;
   }
 
   .asset-manager__title {
@@ -792,6 +866,35 @@
 
   .login__submit {
     @apply w-full;
+  }
+
+  .login__totp-description {
+    @apply text-muted-foreground mb-4 text-sm;
+  }
+
+  .login__totp-back {
+    @apply mt-2 w-full;
+  }
+
+  .login__forgot-password {
+    @apply text-muted-foreground hover:text-interface-text mb-4 block text-sm underline-offset-2 hover:underline;
+  }
+
+  /* TOTP setup dialog */
+  .totp-setup__qr {
+    @apply flex justify-center rounded bg-white p-3;
+  }
+
+  .totp-setup__manual-key {
+    @apply text-interface-text text-center text-sm;
+  }
+
+  .totp-setup__manual-key code {
+    @apply bg-surface-alt rounded px-1.5 py-0.5 font-mono text-xs break-all;
+  }
+
+  .totp-setup__recovery-codes {
+    @apply bg-surface-alt text-interface-text rounded p-3 font-mono text-sm leading-relaxed;
   }
 
   .editor-title-bar {
@@ -895,12 +998,33 @@
     @apply w-full;
   }
 
+  .markdown-editor__editor-pane--stacked {
+    @apply h-1/2 w-full;
+  }
+
+  .markdown-editor__stacked-layout {
+    @apply flex w-full flex-1 flex-col overflow-hidden;
+  }
+
   .markdown-editor__divider {
-    @apply bg-surface-border h-full w-1;
+    @apply bg-surface-border h-full w-1 shrink-0 cursor-col-resize transition-colors duration-200;
+  }
+
+  .markdown-editor__divider:hover,
+  .markdown-editor__divider--active {
+    @apply bg-brand-light;
+  }
+
+  .markdown-editor__divider--stacked {
+    @apply h-1 w-full cursor-row-resize;
   }
 
   .markdown-editor__preview-container {
     @apply w-1/2 max-w-none flex-1;
+  }
+
+  .markdown-editor__preview-container--stacked {
+    @apply h-1/2 w-full max-w-none;
   }
 
   /* Preview styling */
@@ -1204,6 +1328,18 @@
   /* Shared page dialog styles */
   .page-dialog__fields {
     @apply space-y-4;
+  }
+
+  .page-dialog__title-row {
+    @apply flex items-end gap-1;
+  }
+
+  .page-dialog__title-row > .form-input {
+    @apply flex-1;
+  }
+
+  .page-dialog__date-btn {
+    @apply text-muted mb-0 h-9 w-9 flex-shrink-0 opacity-40 hover:opacity-100;
   }
 
   .dialog__path {
@@ -1541,6 +1677,37 @@
     @apply bg-background/92 border-surface-border border-b backdrop-blur-sm md:h-12;
   }
 
+  /* The subheader bar/border itself stays full-width (this is a sibling of
+     the toc pane, not inside it, so the scrollbar stays at the true outer
+     edge and the border spans the whole row). This padding instead shrinks
+     just its own content box to match <main>'s width, so
+     .page-viewer__subheader-inner's mx-auto centers at the same x position
+     as the article — same effect as being a real flex sibling of the toc
+     pane, without actually being one. Transitions in lockstep with
+     .app-layout__toc-pane's own width (same 200ms/values) so the two stay
+     aligned mid-animation, not just at rest. */
+  @media (min-width: 1280px) {
+    /* transition lives on the base rule, not the reserved/collapsed
+       variants below, so it survives class removal (e.g. navigating to a
+       page without a toc). If it lived on the variant class instead, React
+       removing that class would remove the transition instruction in the
+       same commit as the padding-right change, and the browser would have
+       nothing left to animate from — an instant snap instead of an
+       animation. Mirrors .app-layout__toc-pane, which puts its width
+       transition on the always-present base class for the same reason. */
+    .page-viewer__subheader {
+      transition: padding-right 200ms ease;
+    }
+
+    .page-viewer__subheader--toc-reserved {
+      padding-right: 16rem;
+    }
+
+    .page-viewer__subheader--toc-reserved-collapsed {
+      padding-right: 3rem;
+    }
+  }
+
   .page-viewer__subheader-inner {
     @apply mx-auto flex w-full max-w-5xl flex-col gap-2 px-4 pt-0.75 pb-1.25 sm:px-8 md:h-full md:flex-row md:items-center md:justify-between md:gap-4 md:py-0;
   }
@@ -1553,8 +1720,12 @@
     @apply flex min-w-0 flex-col justify-center gap-0.5;
   }
 
+  /* Falls back to the dropdown below the reserved side panel's breakpoint
+     (see .app-layout__toc-pane) — same xl breakpoint, since the panel now
+     takes real space rather than floating, so there's no overlap risk to
+     guard against with a more precise measurement. */
   .page-viewer__toc-button {
-    @apply flex w-auto items-center self-start md:shrink-0 md:justify-end md:self-center;
+    @apply flex w-auto items-center self-start md:shrink-0 md:justify-end md:self-center xl:hidden;
   }
 
   .page-viewer__metadata-bar-inner {
@@ -1563,6 +1734,83 @@
 
   .page-viewer__body {
     @apply flex min-h-0 flex-1 flex-col gap-8;
+  }
+
+  /* TOC panel renders inside app-layout__toc-pane (right pane portal), which
+     animates its own width (16rem <-> 3rem) on collapse/expand (see
+     .app-layout__toc-pane) — <main> and the subheader both reflow to
+     reclaim/give up that space. The border fades with the content via
+     border-color (not display/width), independent of the always-visible
+     header/toggle button below. */
+  .page-viewer__toc-panel {
+    @apply border-surface-border flex min-h-0 w-full flex-1 flex-col border-l pb-4 pl-3 transition-colors duration-200;
+  }
+
+  .page-viewer__toc-panel--collapsed {
+    @apply border-transparent;
+  }
+
+  .page-viewer__toc-panel-header {
+    @apply mb-2 flex items-center justify-between gap-2;
+  }
+
+  /* No opacity fade here: min-width: 0 + nowrap + overflow-hidden mean this
+     already shrinks/clips in real time as .app-layout__toc-pane's own width
+     transition narrows it — that reads as the text sliding away under the
+     collapsing edge, not a fade. visibility is delayed on the way out (so
+     Playwright/AT visibility checks stay accurate) but flips back
+     immediately on the way in. */
+  .page-viewer__toc-panel-title {
+    @apply text-interface-text min-w-0 flex-1 overflow-hidden text-xs font-semibold tracking-wide whitespace-nowrap uppercase;
+    visibility: visible;
+    transition: visibility 0s linear 0s;
+  }
+
+  /* Toggle button is a single, always-mounted element (see TocSidePanel.tsx)
+     rather than two swapped elements — only its icon changes between
+     collapsed/expanded. shrink-0 keeps it a fixed size as the title shrinks
+     away and the pane narrows around it. */
+  .page-viewer__toc-panel-toggle-button {
+    @apply text-interface-text/60 hover:text-interface-text hover:bg-surface-alt flex shrink-0 cursor-pointer items-center justify-center rounded p-1 transition-colors;
+    background: none;
+    border: none;
+  }
+
+  /* flex: 1 + min-height: 0 lets this take whatever space is left in the
+     panel after the fixed-height header and scroll internally once that's
+     less than the entry list's natural height — the header stays put and
+     only the entries scroll, instead of the whole sticky panel growing
+     past the bottom of the viewport (see .app-layout__toc-pane). */
+  .page-viewer__toc-panel-list {
+    @apply min-h-0 flex-1 overflow-y-auto;
+    visibility: visible;
+    transition: visibility 0s linear 0s;
+  }
+
+  /* No opacity — entries are w-full block elements, so they already track
+     .app-layout__toc-pane's width transition frame-by-frame (real flex/block
+     reflow, not a separate animation), and overflow-hidden + whitespace-
+     nowrap on .page-viewer__toc-panel-entry clip the text as that shrinks.
+     That's the "slide the content away" motion; this class just makes it
+     non-interactive and, after the collapse finishes (transition-delay),
+     hidden from assistive tech / Playwright visibility checks. */
+  .page-viewer__toc-panel-hidden {
+    @apply pointer-events-none;
+    visibility: hidden;
+    transition-delay: 200ms;
+  }
+
+  /* Single-line + ellipsis: without this, long headings wrap to multiple
+     lines as the pane narrows during the collapse transition, which reads as
+     jumbled reflow rather than a clean shrink. */
+  .page-viewer__toc-panel-entry {
+    @apply text-interface-text/70 hover:text-interface-text block w-full cursor-pointer overflow-hidden py-0.5 pr-3 text-left text-sm leading-snug text-ellipsis whitespace-nowrap no-underline transition-colors;
+    background: none;
+    border: none;
+  }
+
+  .page-viewer__toc-panel-entry--active {
+    @apply text-brand font-medium;
   }
 
   .page-viewer__error {
@@ -2063,7 +2311,7 @@
   }
 
   .table-wrapper table {
-    @apply w-full border-collapse;
+    @apply w-fit max-w-full border-collapse;
   }
 
   .table-wrapper tbody tr:nth-child(odd) {
@@ -2182,6 +2430,12 @@
     @apply ml-0.5 text-[0.7em];
   }
 
+  .markdown-editor__preview mark,
+  .page-viewer__content mark,
+  .page-history__preview-body mark {
+    @apply bg-warning/25 rounded-sm px-0.5 text-inherit;
+  }
+
   .markdown-editor__preview .markdown-shoutout,
   .page-viewer__content .markdown-shoutout,
   .page-history__preview-body .markdown-shoutout {
@@ -2284,12 +2538,99 @@
     @apply border-green-500/30 bg-green-500/10;
   }
 
+  .markdown-editor__preview .markdown-shoutout--orange,
+  .page-viewer__content .markdown-shoutout--orange,
+  .page-history__preview-body .markdown-shoutout--orange {
+    @apply border-orange-500/30 bg-orange-500/10;
+  }
+
+  .markdown-editor__preview .markdown-collapsible,
+  .page-viewer__content .markdown-collapsible,
+  .page-history__preview-body .markdown-collapsible {
+    @apply border-border/70 bg-surface-alt text-page-text my-6 rounded-lg border px-4 py-3;
+  }
+
+  .markdown-editor__preview .markdown-collapsible > summary,
+  .page-viewer__content .markdown-collapsible > summary,
+  .page-history__preview-body .markdown-collapsible > summary {
+    @apply -mx-4 -my-3 flex cursor-pointer list-none items-center gap-2 rounded-lg px-4 py-3 text-sm font-semibold select-none;
+  }
+
+  .markdown-editor__preview
+    .markdown-collapsible
+    > summary::-webkit-details-marker,
+  .page-viewer__content .markdown-collapsible > summary::-webkit-details-marker,
+  .page-history__preview-body
+    .markdown-collapsible
+    > summary::-webkit-details-marker {
+    display: none;
+  }
+
+  .markdown-editor__preview .markdown-collapsible > summary::before,
+  .page-viewer__content .markdown-collapsible > summary::before,
+  .page-history__preview-body .markdown-collapsible > summary::before {
+    content: '';
+    @apply border-muted h-1.5 w-1.5 shrink-0 -rotate-45 border-r-2 border-b-2 transition-transform duration-200;
+  }
+
+  .markdown-editor__preview .markdown-collapsible[open] > summary::before,
+  .page-viewer__content .markdown-collapsible[open] > summary::before,
+  .page-history__preview-body .markdown-collapsible[open] > summary::before {
+    @apply rotate-45;
+  }
+
+  .markdown-editor__preview .markdown-collapsible > summary + *,
+  .page-viewer__content .markdown-collapsible > summary + *,
+  .page-history__preview-body .markdown-collapsible > summary + * {
+    @apply mt-3;
+  }
+
+  .markdown-editor__preview .markdown-collapsible > :last-child,
+  .page-viewer__content .markdown-collapsible > :last-child,
+  .page-history__preview-body .markdown-collapsible > :last-child {
+    @apply mb-0;
+  }
+
   .tree-view {
     @apply w-full;
   }
 
-  .tree-view__toolbar {
-    @apply mb-2 flex;
+  .sidebar-accordion-section__header {
+    @apply flex w-full items-center justify-between gap-2 px-1 py-1;
+  }
+
+  .sidebar-accordion-section__title {
+    @apply text-muted hover:text-interface-text flex cursor-pointer items-center gap-1 text-xs font-medium tracking-wide uppercase select-none;
+    background: none;
+    border: none;
+    padding: 0;
+    text-align: left;
+  }
+
+  .sidebar-accordion-section__count {
+    @apply text-muted text-xs font-normal normal-case;
+  }
+
+  .sidebar-accordion-section__actions {
+    @apply flex items-center gap-1;
+  }
+
+  .sidebar-accordion-section__trigger {
+    @apply text-muted hover:text-interface-text flex cursor-pointer items-center justify-center rounded p-0.5 opacity-70 hover:opacity-100;
+    background: none;
+    border: none;
+  }
+
+  .sidebar-accordion-section__trigger svg {
+    @apply transition-transform duration-200;
+  }
+
+  .sidebar-accordion-section__trigger[data-state='open'] svg {
+    @apply rotate-180;
+  }
+
+  .sidebar-accordion-section__content {
+    @apply pt-1 pb-2;
   }
 
   .tree-view__status {
@@ -2312,8 +2653,72 @@
     @apply w-full;
   }
 
+  .tree-view__pinned {
+    @apply w-full;
+  }
+
+  .tree-view__pinned-item {
+    @apply text-interface-text relative flex items-center text-sm;
+  }
+
+  .tree-view__pinned-item--active {
+    @apply text-brand;
+  }
+
+  .tree-view__pinned-item:not(.tree-view__pinned-item--active):hover {
+    @apply bg-tree-node-hover;
+  }
+
+  .tree-view__pinned-item-link {
+    @apply flex min-w-0 flex-1 items-center gap-1.5 truncate px-1 py-2 no-underline;
+    color: inherit;
+  }
+
+  .tree-view__pinned-item-icon {
+    @apply shrink-0 opacity-60;
+  }
+
+  .tree-view__pinned-item-title {
+    @apply truncate;
+  }
+
+  .tree-view__pinned-item-unpin {
+    @apply text-muted hover:text-interface-text ml-auto shrink-0 cursor-pointer rounded p-0.5 opacity-70 hover:opacity-100;
+    background: none;
+    border: none;
+  }
+
+  .tree-view__favorite-item {
+    @apply text-interface-text relative flex items-center text-sm;
+  }
+
+  .tree-view__favorite-item--active {
+    @apply text-brand;
+  }
+
+  .tree-view__favorite-item:not(.tree-view__favorite-item--active):hover {
+    @apply bg-tree-node-hover;
+  }
+
+  .tree-view__favorite-item-link {
+    @apply flex min-w-0 flex-1 items-center gap-1.5 truncate px-1 py-2 no-underline;
+    color: inherit;
+  }
+
+  .tree-view__favorite-item-icon {
+    @apply shrink-0 opacity-60;
+  }
+
+  .tree-view__favorite-item-title {
+    @apply truncate;
+  }
+
+  .tree-view__favorite-item-remove {
+    @apply ml-auto;
+  }
+
   .tree-node {
-    @apply text-interface-text relative flex cursor-pointer items-center transition-all;
+    @apply text-interface-text relative flex cursor-pointer items-center transition-colors;
   }
 
   .tree-node--active {
@@ -2324,12 +2729,25 @@
     @apply hover:bg-tree-node-hover;
   }
 
+  /* Keeps the row of the page a delete confirmation dialog is about to
+     remove visually distinct while that dialog is open, even though the
+     "..." menu that opened it has already closed. Takes precedence over
+     --active (defined below it) since deleting a different page than the
+     one you're currently viewing must never look ambiguous. */
+  .tree-node--delete-target {
+    @apply bg-error/10;
+  }
+
   .tree-node__marker {
     @apply bg-surface-border absolute top-0 bottom-0 w-0.5;
   }
 
   .tree-node__marker--active {
     @apply bg-brand/60;
+  }
+
+  .tree-node__marker--delete-target {
+    @apply bg-error/60;
   }
 
   .tree-node__main {
@@ -2368,6 +2786,10 @@
     @apply text-brand;
   }
 
+  .tree-node__title--delete-target {
+    @apply text-error;
+  }
+
   .tree-node__actions {
     @apply flex gap-1;
     opacity: 0;
@@ -2395,12 +2817,57 @@
     @apply text-muted hover:text-interface-text cursor-pointer;
   }
 
+  .favorite-toggle-button {
+    @apply text-muted hover:text-interface-text shrink-0 cursor-pointer rounded p-0.5 opacity-70 hover:opacity-100;
+    background: none;
+    border: none;
+  }
+
+  .favorite-toggle-button--active {
+    @apply text-brand opacity-100;
+  }
+
+  .page-viewer__favorite-toggle {
+    @apply ml-2 shrink-0;
+  }
+
   .tree-node__children {
     @apply ml-4 pl-2;
   }
 
   .tree-node__children--closed {
     @apply hidden;
+  }
+
+  .tree-node--dragging,
+  .tree-node__children--dragging {
+    @apply opacity-40;
+  }
+
+  .tree-node--drop-inside {
+    @apply bg-brand/10 rounded;
+    box-shadow: inset 0 0 0 1.5px hsl(var(--brand) / 0.45);
+  }
+
+  .tree-node__drop-line {
+    @apply bg-brand pointer-events-none absolute right-1 left-1 z-10 h-0.5 rounded;
+  }
+
+  .tree-node__drop-line--top {
+    top: -1px;
+  }
+
+  .tree-node__drop-line--bottom {
+    bottom: -1px;
+  }
+
+  .tree-node__nest-hint {
+    @apply text-brand pointer-events-none absolute top-1/2 right-2 z-10 -translate-y-1/2;
+  }
+
+  .tree-dnd__overlay {
+    @apply border-surface-border text-interface-text pointer-events-none max-w-56 cursor-grabbing truncate rounded border px-2.5 py-1.5 text-sm shadow-md;
+    background: hsl(var(--surface));
   }
 
   .btn {
@@ -2426,16 +2893,25 @@
     @apply mx-auto w-full max-w-4xl px-4 pt-4 pb-4 sm:px-8 sm:pt-8;
   }
 
-  .settings-nav {
-    @apply border-surface-border mb-6 flex flex-wrap gap-1 border-b pb-3;
+  .settings-nav .list-view__header {
+    @apply border-b-surface-border bg-surface h-12 min-h-0 border-b px-2;
   }
 
-  .settings-nav__link {
-    @apply text-muted-foreground hover:text-foreground rounded-md px-3 py-1.5 text-sm no-underline transition-colors;
+  .settings-nav .list-view__title {
+    @apply text-brand inline-flex items-center gap-1 px-3 py-1.5 text-sm font-normal;
   }
 
-  .settings-nav__link--active {
-    @apply bg-accent text-foreground font-medium;
+  .settings-nav .list-view__content {
+    @apply p-2;
+  }
+
+  .settings-nav .list-view__item {
+    @apply flex items-center gap-2.5 rounded-none text-sm;
+  }
+
+  .settings-nav .list-view__item--active {
+    @apply border-surface-border/0 bg-surface-alt text-brand;
+    box-shadow: inset 3px 0 0 hsl(var(--brand));
   }
 
   .settings__title {
@@ -2456,6 +2932,14 @@
 
   .settings__field {
     @apply mb-4;
+  }
+
+  .settings__checkbox-label {
+    @apply flex items-center gap-2;
+  }
+
+  .settings__field-label {
+    @apply text-interface-text mb-2 block text-sm font-medium;
   }
 
   .settings__preview {
@@ -2484,6 +2968,18 @@
 
   .settings__hint {
     @apply text-muted mt-1 text-xs;
+  }
+
+  .settings__status-line {
+    @apply text-interface-text mb-3 flex items-center gap-2 text-sm;
+  }
+
+  .settings__status-icon {
+    @apply text-muted h-4 w-4 shrink-0;
+  }
+
+  .settings__notice {
+    @apply border-surface-border bg-surface-alt text-muted flex flex-col gap-1 rounded-md border p-3 text-sm;
   }
 
   .settings__actions {
@@ -3079,7 +3575,7 @@
     position: relative;
   }
 
-  main article .anchor .headline-anchor span svg {
+  main article .anchor .headline-anchor .headline-anchor__icon svg {
     @apply text-headline-anchor-icon;
   }
 
@@ -3093,15 +3589,19 @@
     @apply relative no-underline;
   }
 
-  #markdown-preview-container .anchor .headline-anchor span svg {
+  #markdown-preview-container
+    .anchor
+    .headline-anchor
+    .headline-anchor__icon
+    svg {
     @apply hidden;
   }
 
-  main article .anchor .headline-anchor span {
+  main article .anchor .headline-anchor .headline-anchor__icon {
     @apply absolute top-1/2 -left-7 -translate-y-1/2 opacity-0 transition-opacity duration-200;
   }
 
-  main article .anchor .headline-anchor:hover span {
+  main article .anchor .headline-anchor:hover .headline-anchor__icon {
     @apply opacity-100;
   }
 }
@@ -3121,14 +3621,31 @@
       margin: 1cm;
     }
 
+    /* Neutralise every scroll/clip container between <html> and the article.
+       Chromium treats a box whose `overflow` is not `visible` as monolithic
+       (unbreakable) during pagination, so content crossing a page boundary is
+       clipped instead of flowing onto the next page — see #1531. The flex
+       `min-height`/`height` constraints from the on-screen layout have to go
+       for the same reason. */
     main,
     article,
     #root,
     .app-layout__content-wrapper,
+    .app-layout__main-column,
+    .app-layout__main-content-area,
+    .app-layout__main-content-area-editor,
+    .app-layout__content-row,
     .page-viewer,
-    .page-viewer__content {
+    .page-viewer__body,
+    .page-viewer__content,
+    .page-history__preview-body,
+    .markdown-editor__preview,
+    .table-wrapper {
       background: #fff !important;
-      overflow: visible;
+      overflow: visible !important;
+      height: auto !important;
+      max-height: none !important;
+      min-height: 0 !important;
     }
 
     main {
@@ -3137,8 +3654,62 @@
       border: 0 !important;
     }
 
-    .app-layout__content-wrapper {
-      height: auto !important;
+    /* Page-break hygiene for the rendered markdown: keep a heading with the
+       text it introduces, and don't split atomic blocks down the middle. */
+    .page-viewer__content,
+    .page-history__preview-body,
+    .markdown-editor__preview {
+      orphans: 3;
+      widows: 3;
+    }
+
+    .page-viewer__content :where(h1, h2, h3, h4, h5, h6),
+    .page-history__preview-body :where(h1, h2, h3, h4, h5, h6),
+    .markdown-editor__preview :where(h1, h2, h3, h4, h5, h6) {
+      break-after: avoid;
+      break-inside: avoid;
+    }
+
+    .page-viewer__content
+      :where(
+        pre,
+        blockquote,
+        figure,
+        img,
+        tr,
+        thead,
+        .katex-display,
+        .markdown-shoutout
+      ),
+    .page-history__preview-body
+      :where(
+        pre,
+        blockquote,
+        figure,
+        img,
+        tr,
+        thead,
+        .katex-display,
+        .markdown-shoutout
+      ),
+    .markdown-editor__preview
+      :where(
+        pre,
+        blockquote,
+        figure,
+        img,
+        tr,
+        thead,
+        .katex-display,
+        .markdown-shoutout
+      ) {
+      break-inside: avoid;
+    }
+
+    .page-viewer__content :where(img),
+    .page-history__preview-body :where(img),
+    .markdown-editor__preview :where(img) {
+      max-height: 100vh;
     }
 
     html.dark,
@@ -3194,6 +3765,7 @@
       --markdown-toolbar-text: 215 25% 27% !important;
 
       --muted: 215 16% 47% !important;
+      --muted-surface: 210 40% 96% !important;
       --muted-foreground: 215 16% 47% !important;
 
       --headline-anchor-icon: 215 20% 65% !important;
@@ -3242,6 +3814,13 @@
     #sidebar-container,
     header,
     .sidebar-wrapper {
+      display: none !important;
+    }
+
+    /* The side TOC pane is navigation chrome, not article content — the
+       in-flow inline TOC is already `print:hidden` for the same reason. */
+    #app-toc-pane-root,
+    .app-layout__toc-pane {
       display: none !important;
     }
 

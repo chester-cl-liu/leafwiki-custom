@@ -8,6 +8,7 @@ import (
 	"github.com/gin-gonic/gin"
 	sharederrors "github.com/perber/wiki/internal/core/shared/errors"
 	"github.com/perber/wiki/internal/core/tree"
+	"github.com/perber/wiki/internal/favorites"
 )
 
 // Error codes for the pages domain.
@@ -97,6 +98,8 @@ func respondWithPageError(c *gin.Context, err error) {
 		respondWithPageStatusError(c, http.StatusBadRequest, ErrCodePageCannotMoveToSelf, "Page cannot be moved to itself", "page cannot be moved to itself")
 	case errors.Is(err, tree.ErrConvertNotAllowed):
 		respondWithPageStatusError(c, http.StatusBadRequest, ErrCodePageConvertNotAllowed, "Convert operation not allowed", "convert not allowed")
+	case errors.Is(err, tree.ErrInvalidOperation):
+		respondWithPageStatusError(c, http.StatusBadRequest, ErrCodePageInvalidRequest, err.Error(), "invalid operation")
 	case errors.Is(err, tree.ErrVersionConflict):
 		respondWithPageStatusError(c, http.StatusConflict, ErrCodePageVersionConflict, "Page was changed by another request", "page was changed by another request")
 	case errors.Is(err, tree.ErrVersionRequired):
@@ -119,6 +122,8 @@ func pageErrorStatus(code string) int {
 		return http.StatusBadRequest
 	case ErrCodePageVersionConflict:
 		return http.StatusConflict
+	case favorites.ErrCodeFavoritesStoreUnavailable:
+		return http.StatusServiceUnavailable
 	default:
 		return http.StatusInternalServerError
 	}

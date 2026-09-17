@@ -7,9 +7,9 @@ import { getWikiTargetRoutePath } from '@/lib/wikiPath'
 import { useDialogsStore } from '@/stores/dialogs'
 import { useTreeStore } from '@/stores/tree'
 import { useCallback, useEffect, useRef } from 'react'
-import { useLocation, useNavigate, useParams } from 'react-router-dom'
+import { useTranslation } from 'react-i18next'
+import { useLocation, useNavigate, useParams } from 'react-router'
 import { toast } from 'sonner'
-import { useProgressbarStore } from '../progressbar/progressbarStore'
 import MarkdownEditor, { MarkdownEditorRef } from './MarkdownEditor'
 import { PageFrontmatterPanel } from './PageFrontmatterPanel'
 import { usePageEditorStore } from './pageEditorStore'
@@ -19,6 +19,7 @@ import useNavigationGuard from './useNavigationGuard'
 import { useToolbarActions } from './useToolbarActions'
 
 export default function PageEditor() {
+  const { t } = useTranslation('editor')
   const { '*': path } = useParams()
 
   const { pathname } = useLocation()
@@ -41,7 +42,6 @@ export default function PageEditor() {
   )
   const frontmatterErrors = usePageEditorStore((s) => s.frontmatterErrors)
   const notFound = usePageEditorStore((s) => s.notFound)
-  const loading = useProgressbarStore((s) => s.loading)
   const error = usePageEditorStore((s) => s.error)
   const openNode = useTreeStore((s) => s.openNode)
   const dirty = usePageEditorStore(isDirtyState)
@@ -69,6 +69,17 @@ export default function PageEditor() {
     openNode(initialPage.id)
   }, [openNode, initialPage?.id])
 
+  // Reset the editor store on unmount so stale `page` data (and thus
+  // currentEditorPageId reads elsewhere) doesn't outlive the editor session.
+  // Declared after useAutoSave() so its cleanup runs after useAutoSave's own
+  // unmount cleanup, which may synchronously kick off a flush save that reads
+  // store state before it's cleared here.
+  useEffect(() => {
+    return () => {
+      usePageEditorStore.getState().resetEditorState()
+    }
+  }, [])
+
   // callbacks to save / close
   const handleSave = useCallback(() => {
     savePage()
@@ -79,20 +90,20 @@ export default function PageEditor() {
             '',
             buildBrowserEditUrl(`/${page?.path}`),
           )
-          toast.success('Page saved successfully')
+          toast.success(t('pageEditor.savedToast'))
         }
       })
       .catch((err) => {
         const localized = asApiLocalizedError(err)
         if (localized?.code === 'page_version_conflict') {
-          const mapped = mapApiError(err, 'Error saving page')
+          const mapped = mapApiError(err, t('pageEditor.saveErrorFallback'))
           toast.error(mapped.message, {
             duration: 10000,
             testId: 'page-save-version-conflict-toast',
             action: {
               label: (
                 <span data-testid="page-save-version-conflict-action">
-                  Save anyway
+                  {t('pageEditor.saveAnyway')}
                 </span>
               ),
               onClick: () => {
@@ -104,20 +115,19 @@ export default function PageEditor() {
                         '',
                         buildBrowserEditUrl(`/${page.path}`),
                       )
-                      toast.success('Page saved successfully')
+                      toast.success(t('pageEditor.savedToast'))
                     }
                   })
                   .catch((overwriteErr) => {
                     const overwriteLocalized = asApiLocalizedError(overwriteErr)
                     if (overwriteLocalized?.code === 'page_version_conflict') {
-                      toast.error(
-                        'The page was modified again while saving. Please reload the page and re-apply your changes.',
-                        { duration: 8000 },
-                      )
+                      toast.error(t('pageEditor.conflictAgainMessage'), {
+                        duration: 8000,
+                      })
                     } else {
                       const overwriteMapped = mapApiError(
                         overwriteErr,
-                        'Error saving page',
+                        t('pageEditor.saveErrorFallback'),
                       )
                       toast.error(overwriteMapped.message)
                     }
@@ -126,11 +136,11 @@ export default function PageEditor() {
             },
           })
         } else {
-          const mapped = mapApiError(err, 'Error saving page')
+          const mapped = mapApiError(err, t('pageEditor.saveErrorFallback'))
           toast.error(mapped.message)
         }
       })
-  }, [savePage, forceOverwrite])
+  }, [savePage, forceOverwrite, t])
 
   const handleClose = useCallback(() => {
     const state = usePageEditorStore.getState()
@@ -188,10 +198,12 @@ export default function PageEditor() {
     return <Page404 targetPath={getWikiTargetRoutePath(pathname)} />
   }
 
-  if (error) return <p className="page-editor__error">Error: {error}</p>
-
-  if (!initialPage && !loading)
-    return <Page404 targetPath={getWikiTargetRoutePath(pathname)} />
+  if (error)
+    return (
+      <p className="page-editor__error">
+        {t('pageEditor.errorPrefix', { error })}
+      </p>
+    )
 
   return (
     <>

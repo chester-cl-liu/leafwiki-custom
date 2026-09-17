@@ -14,6 +14,11 @@ import (
 )
 
 // BrandingService provides branding operations
+const (
+	errFailedToDeleteLogo    = "Failed to delete logo"
+	errFailedToDeleteFavicon = "Failed to delete favicon"
+)
+
 type BrandingService struct {
 	store          *BrandingStore
 	brandingConfig *BrandingConfig
@@ -40,6 +45,22 @@ func NewBrandingService(storageDir string) (*BrandingService, error) {
 	}, nil
 }
 
+// Reload re-reads the branding configuration from disk and replaces the
+// in-memory cache. Used after a restore swaps in a different branding.json —
+// without this, GetBranding/UpdateBranding would keep serving the pre-restore
+// config until the process next restarted.
+func (s *BrandingService) Reload() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	cfg, err := s.store.Load()
+	if err != nil {
+		return fmt.Errorf("failed to reload branding config: %w", err)
+	}
+	s.brandingConfig = cfg
+	return nil
+}
+
 // GetBranding returns the current branding configuration
 func (s *BrandingService) GetBranding() (*BrandingConfigResponse, error) {
 	s.mu.RLock()
@@ -56,11 +77,12 @@ func (s *BrandingService) UpdateBranding(siteName string) error {
 	ve := sharederrors.NewValidationErrors()
 	trimmedSiteName := strings.TrimSpace(siteName)
 
-	if trimmedSiteName == "" {
+	switch {
+	case trimmedSiteName == "":
 		ve.Add("siteName", "Site name must not be empty")
-	} else if len(trimmedSiteName) > s.brandingConfig.BrandingConstraints.MaxSiteNameLength {
+	case len(trimmedSiteName) > s.brandingConfig.BrandingConstraints.MaxSiteNameLength:
 		ve.Add("siteName", fmt.Sprintf("Site name must not exceed %d characters", s.brandingConfig.BrandingConstraints.MaxSiteNameLength))
-	} else if containsControlCharacters(trimmedSiteName) {
+	case containsControlCharacters(trimmedSiteName):
 		ve.Add("siteName", "Site name contains invalid control characters")
 	}
 
@@ -175,7 +197,7 @@ func (s *BrandingService) DeleteLogo() error {
 	if containsPathTraversal(s.brandingConfig.LogoFile) {
 		return sharederrors.NewLocalizedError(
 			"branding_logo_delete_failed",
-			"Failed to delete logo",
+			errFailedToDeleteLogo,
 			"invalid logo file path",
 			nil,
 		)
@@ -185,7 +207,7 @@ func (s *BrandingService) DeleteLogo() error {
 	if err := os.Remove(logoPath); err != nil && !os.IsNotExist(err) {
 		return sharederrors.NewLocalizedError(
 			"branding_logo_delete_failed",
-			"Failed to delete logo",
+			errFailedToDeleteLogo,
 			"failed to delete logo",
 			err,
 		)
@@ -195,7 +217,7 @@ func (s *BrandingService) DeleteLogo() error {
 	if err := s.store.Save(s.brandingConfig); err != nil {
 		return sharederrors.NewLocalizedError(
 			"branding_logo_delete_failed",
-			"Failed to delete logo",
+			errFailedToDeleteLogo,
 			"failed to delete logo",
 			err,
 		)
@@ -265,7 +287,7 @@ func (s *BrandingService) DeleteFavicon() error {
 	if containsPathTraversal(s.brandingConfig.FaviconFile) {
 		return sharederrors.NewLocalizedError(
 			"branding_favicon_delete_failed",
-			"Failed to delete favicon",
+			errFailedToDeleteFavicon,
 			"invalid favicon file path",
 			nil,
 		)
@@ -275,7 +297,7 @@ func (s *BrandingService) DeleteFavicon() error {
 	if err := os.Remove(faviconPath); err != nil && !os.IsNotExist(err) {
 		return sharederrors.NewLocalizedError(
 			"branding_favicon_delete_failed",
-			"Failed to delete favicon",
+			errFailedToDeleteFavicon,
 			"failed to delete favicon",
 			err,
 		)
@@ -285,7 +307,7 @@ func (s *BrandingService) DeleteFavicon() error {
 	if err := s.store.Save(s.brandingConfig); err != nil {
 		return sharederrors.NewLocalizedError(
 			"branding_favicon_delete_failed",
-			"Failed to delete favicon",
+			errFailedToDeleteFavicon,
 			"failed to delete favicon",
 			err,
 		)

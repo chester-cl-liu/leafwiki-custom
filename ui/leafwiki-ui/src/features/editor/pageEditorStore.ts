@@ -9,6 +9,7 @@ import {
   updatePage,
 } from '@/lib/api/pages'
 import { isPageNotFoundError, mapApiError } from '@/lib/api/errors'
+import i18next from '@/lib/i18n'
 import { useConfigStore } from '@/stores/config'
 import { useTreeStore } from '@/stores/tree'
 import { create } from 'zustand'
@@ -30,6 +31,7 @@ export interface PageEditorState {
   frontmatterUnsupported: string
   frontmatterErrors: Record<string, string>
   error: string | null // error message, if any
+  isLoading: boolean
   notFound: boolean
   page: Page | null // current page being edited
   initialPage: Page | null // initial page data when loaded
@@ -44,6 +46,7 @@ export interface PageEditorState {
   savePage: (options?: { silent?: boolean }) => Promise<Page | null | undefined> // save the current page
   forceOverwrite: () => Promise<Page | null | undefined> // re-fetch server version, then save
   loadPageData: (path: string) => Promise<void> // load page data by path
+  resetEditorState: () => void // clear the store back to its pristine (no page loaded) shape
 }
 
 function tagsChanged(current: string[], original: string[]): boolean {
@@ -93,8 +96,11 @@ export const isDirtyState = (s: PageEditorState) => {
 // Manual saves (silent=false) bypass this so Ctrl+S is never blocked by an in-flight auto-save.
 let isSavingMutex = false
 
+let loadController: AbortController | null = null
+
 export const usePageEditorStore = create<PageEditorState>((set, get) => ({
   error: null,
+  isLoading: false,
   notFound: false,
   page: null,
   title: '',
@@ -143,7 +149,9 @@ export const usePageEditorStore = create<PageEditorState>((set, get) => ({
     )
     if (Object.keys(frontmatterErrors).length > 0) {
       set({ frontmatterErrors })
-      throw new Error('Please fix metadata errors before saving.')
+      throw new Error(
+        i18next.t('pageEditor.metadataErrorsBeforeSave', { ns: 'editor' }),
+      )
     }
 
     // Only block concurrent auto-saves; manual saves always proceed
@@ -170,7 +178,9 @@ export const usePageEditorStore = create<PageEditorState>((set, get) => ({
           title,
           slug,
         })
-        const rewriteLinks = await confirmPageRefactor(preview)
+        const rewriteLinks = await confirmPageRefactor(preview, {
+          allowSkipRewrite: true,
+        })
         if (rewriteLinks === null) {
           return null
         }
@@ -222,7 +232,9 @@ export const usePageEditorStore = create<PageEditorState>((set, get) => ({
           updatedPage?.content === null ||
           updatedPage?.content === undefined
         ) {
-          throw new Error('Updated page content is null or undefined')
+          throw new Error(
+            i18next.t('pageEditor.contentNullFallback', { ns: 'editor' }),
+          )
         }
         state.page.title = updatedPage.title
         state.page.slug = updatedPage.slug
@@ -293,16 +305,21 @@ export const usePageEditorStore = create<PageEditorState>((set, get) => ({
     return get().savePage()
   },
   loadPageData: async (path: string) => {
+    loadController?.abort()
+    loadController = new AbortController()
+    const { signal } = loadController
+
+    useProgressbarStore.getState().setLoading(true)
     set({
       error: null,
+      isLoading: true,
       notFound: false,
       page: null,
       initialPage: null,
       frontmatterErrors: {},
     })
-    useProgressbarStore.getState().setLoading(true)
     try {
-      const page = await getPageByPath(path)
+      const page = await getPageByPath(path, signal)
       const fields: EditorFrontmatterField[] = Object.entries(
         page.properties ?? {},
       ).map(([key, value]) => ({
@@ -322,6 +339,8 @@ export const usePageEditorStore = create<PageEditorState>((set, get) => ({
         frontmatterUnsupported: '',
       })
     } catch (err) {
+      if (signal.aborted) return
+
       if (isPageNotFoundError(err)) {
         set({
           error: null,
@@ -330,13 +349,39 @@ export const usePageEditorStore = create<PageEditorState>((set, get) => ({
         return
       }
 
-      const mapped = mapApiError(err, 'An unknown error occurred')
+      const mapped = mapApiError(
+        err,
+        i18next.t('pageEditor.unknownErrorFallback', { ns: 'editor' }),
+      )
       set({
         error: mapped.message,
         notFound: false,
       })
     } finally {
-      useProgressbarStore.getState().setLoading(false)
+      if (!signal.aborted) {
+        set({ isLoading: false })
+        useProgressbarStore.getState().setLoading(false)
+      }
     }
+  },
+  // Called when PageEditor unmounts so `page` (and thus currentEditorPageId
+  // reads elsewhere, e.g. TreeNodeActionsMenu's rename/delete guards) doesn't
+  // keep pointing at the last-edited page indefinitely after the editor closes.
+  resetEditorState: () => {
+    loadController?.abort()
+    set({
+      error: null,
+      isLoading: false,
+      notFound: false,
+      page: null,
+      title: '',
+      slug: '',
+      content: '',
+      tags: [],
+      frontmatterFields: [],
+      frontmatterUnsupported: '',
+      frontmatterErrors: {},
+      initialPage: null,
+    })
   },
 }))

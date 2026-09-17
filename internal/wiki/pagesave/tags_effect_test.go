@@ -24,7 +24,7 @@ func setupTagsEffectTest(t *testing.T) (*tree.TreeService, *tags.TagsService, *T
 	t.Cleanup(func() { test_utils.WrapCloseWithErrorCheck(store.Close, t) })
 
 	svc := tags.NewTagsService(store)
-	effect := NewTagsSideEffect(svc, nil)
+	effect := NewTagsSideEffect(svc, nil, nil)
 	return treeSvc, svc, effect
 }
 
@@ -37,7 +37,7 @@ func createPageWithFrontmatter(t *testing.T, treeSvc *tree.TreeService, title, s
 	if err != nil {
 		t.Fatalf("CreateNode(%q): %v", title, err)
 	}
-	if err := treeSvc.UpdateNode("system", *id, title, slug, &raw, tree.VersionUnchecked, true); err != nil {
+	if err := treeSvc.UpdateNode("system", *id, title, slug, &raw, tree.VersionUnchecked, nil, nil, true); err != nil {
 		t.Fatalf("UpdateNode(%q): %v", title, err)
 	}
 	page, err := treeSvc.GetPage(*id)
@@ -86,7 +86,7 @@ func TestTagsSideEffect_Apply_Update_ReindexesTags(t *testing.T) {
 	effect.Apply(PageSaveEvent{Operation: PageOperationCreate, After: page})
 
 	newRaw := "---\ntags:\n  - newtag\n---\n\nUpdated."
-	if err := treeSvc.UpdateNode("system", page.ID, "Update Tags", "update-tags", &newRaw, tree.VersionUnchecked, true); err != nil {
+	if err := treeSvc.UpdateNode("system", page.ID, "Update Tags", "update-tags", &newRaw, tree.VersionUnchecked, nil, nil, true); err != nil {
 		t.Fatalf("UpdateNode: %v", err)
 	}
 	updated, err := treeSvc.GetPage(page.ID)
@@ -132,5 +132,30 @@ func TestTagsSideEffect_Apply_Delete_RemovesTags(t *testing.T) {
 	}
 	if len(ids) != 0 {
 		t.Errorf("expected tag to be removed after delete, got %v", ids)
+	}
+}
+
+func TestTagsSideEffect_Apply_Delete_Recursive_RemovesTagsForAllAffectedPages(t *testing.T) {
+	treeSvc, tagsSvc, effect := setupTagsEffectTest(t)
+
+	rawA := "---\ntags:\n  - subtree\n---\n\nA."
+	rawB := "---\ntags:\n  - subtree\n---\n\nB."
+	pageA := createPageWithFrontmatter(t, treeSvc, "Subtree A", "subtree-a", rawA)
+	pageB := createPageWithFrontmatter(t, treeSvc, "Subtree B", "subtree-b", rawB)
+
+	effect.Apply(PageSaveEvent{Operation: PageOperationCreate, After: pageA})
+	effect.Apply(PageSaveEvent{Operation: PageOperationCreate, After: pageB})
+
+	effect.Apply(PageSaveEvent{
+		Operation:     PageOperationDelete,
+		AffectedPages: []*tree.Page{pageA, pageB},
+	})
+
+	ids, err := tagsSvc.GetPageIDsByTags([]string{"subtree"})
+	if err != nil {
+		t.Fatalf("GetPageIDsByTags: %v", err)
+	}
+	if len(ids) != 0 {
+		t.Errorf("expected both pages' tags to be removed after batch delete, got %v", ids)
 	}
 }

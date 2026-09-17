@@ -9,6 +9,7 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { ChevronDown, ChevronRight, Plus, Tag, Trash2 } from 'lucide-react'
 import { useMemo, useState } from 'react'
+import { Trans, useTranslation } from 'react-i18next'
 import { EditorFrontmatterField } from './frontmatter'
 
 const METADATA_ALLOWED_HOTKEYS = 'Mod+KeyS Escape'
@@ -50,6 +51,7 @@ export function PageFrontmatterPanel({
   onTagsChange,
   onFieldsChange,
 }: PageFrontmatterPanelProps) {
+  const { t } = useTranslation('editor')
   const [showInternalFields, setShowInternalFields] = useState(false)
 
   const normalizedTags = useMemo(() => {
@@ -150,7 +152,9 @@ export function PageFrontmatterPanel({
                 className={`page-frontmatter-panel__title-row${hasErrors ? 'page-frontmatter-panel__title-row--has-errors' : ''}`}
               >
                 <Tag className="page-frontmatter-panel__title-icon" size={14} />
-                <span className="page-frontmatter-panel__title">Metadata</span>
+                <span className="page-frontmatter-panel__title">
+                  {t('frontmatterPanel.metadataTitle')}
+                </span>
               </div>
               <span
                 className={`page-frontmatter-panel__summary${hasErrors ? 'page-frontmatter-panel__summary--has-errors' : ''}`}
@@ -163,13 +167,13 @@ export function PageFrontmatterPanel({
             <div className="page-frontmatter-panel__stack">
               <div className="page-frontmatter-panel__row page-frontmatter-panel__row--tags">
                 <div className="page-frontmatter-panel__section-heading page-frontmatter-panel__section-heading--inline">
-                  Tags
+                  {t('frontmatterPanel.tagsHeading')}
                 </div>
                 <div className="page-frontmatter-panel__tags-field">
                   <TagInputWithSuggestions
                     tags={normalizedTags}
                     onTagsChange={onTagsChange}
-                    placeholder="Add tag"
+                    placeholder={t('frontmatterPanel.addTagPlaceholder')}
                     variant="metadata"
                     inputTestId="page-frontmatter-tag-input"
                     inputHotkeys={METADATA_ALLOWED_HOTKEYS}
@@ -187,7 +191,7 @@ export function PageFrontmatterPanel({
 
               <div className="page-frontmatter-panel__row page-frontmatter-panel__row--properties">
                 <div className="page-frontmatter-panel__section-heading page-frontmatter-panel__section-heading--inline">
-                  Properties
+                  {t('frontmatterPanel.propertiesHeading')}
                 </div>
                 <div className="page-frontmatter-panel__properties">
                   <div className="page-frontmatter-panel__properties-scroll custom-scrollbar">
@@ -203,7 +207,9 @@ export function PageFrontmatterPanel({
                                     key: event.target.value,
                                   })
                                 }
-                                placeholder="Key"
+                                placeholder={t(
+                                  'frontmatterPanel.keyPlaceholder',
+                                )}
                                 className={`page-frontmatter-panel__field-key${errors[`properties.${index}.key`] ? 'page-frontmatter-panel__input--error' : ''}`}
                                 data-testid={`page-frontmatter-field-key-${index}`}
                                 data-allow-hotkeys={METADATA_ALLOWED_HOTKEYS}
@@ -217,7 +223,9 @@ export function PageFrontmatterPanel({
                                     value: event.target.value,
                                   })
                                 }
-                                placeholder="Value"
+                                placeholder={t(
+                                  'frontmatterPanel.valuePlaceholder',
+                                )}
                                 className={`page-frontmatter-panel__field-value${errors[`properties.${index}.value`] ? 'page-frontmatter-panel__input--error' : ''}`}
                                 data-testid={`page-frontmatter-field-value-${index}`}
                                 data-allow-hotkeys={METADATA_ALLOWED_HOTKEYS}
@@ -226,7 +234,10 @@ export function PageFrontmatterPanel({
                                 type="button"
                                 className="page-frontmatter-panel__field-remove"
                                 onClick={() => removeField(index)}
-                                aria-label={`Remove frontmatter field ${field.key || index + 1}`}
+                                aria-label={t(
+                                  'frontmatterPanel.removeFieldAriaLabel',
+                                  { field: field.key || index + 1 },
+                                )}
                               >
                                 <Trash2 size={14} />
                               </button>
@@ -267,7 +278,7 @@ export function PageFrontmatterPanel({
                           ) : (
                             <ChevronRight size={14} />
                           )}
-                          Internal fields
+                          {t('frontmatterPanel.internalFieldsToggle')}
                         </button>
 
                         {showInternalFields ? (
@@ -307,13 +318,16 @@ export function PageFrontmatterPanel({
                       data-testid="page-frontmatter-add-field"
                     >
                       <Plus size={14} />
-                      Add property
+                      {t('frontmatterPanel.addPropertyButton')}
                     </Button>
                   </div>
 
                   <p className="page-frontmatter-panel__hint">
-                    Keep fields flat for now. If you need nested metadata later,
-                    use dot keys like <code>seo.title</code>.
+                    <Trans
+                      i18nKey="frontmatterPanel.flatHint"
+                      ns="editor"
+                      components={{ code: <code /> }}
+                    />
                   </p>
 
                   {hasUnsupportedFields ? (
@@ -321,8 +335,7 @@ export function PageFrontmatterPanel({
                       className="page-frontmatter-panel__notice"
                       data-testid="page-frontmatter-unsupported-notice"
                     >
-                      Existing advanced frontmatter is preserved in the
-                      background but not editable in this compact view yet.
+                      {t('frontmatterPanel.unsupportedNotice')}
                     </p>
                   ) : null}
                 </div>

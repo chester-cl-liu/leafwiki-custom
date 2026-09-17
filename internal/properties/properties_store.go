@@ -3,7 +3,6 @@ package properties
 import (
 	"database/sql"
 	"fmt"
-	"log/slog"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -25,6 +24,8 @@ type PropertyKeyCount struct {
 	Count int    `json:"count"`
 }
 
+const logCloseRowsFailed = "could not close rows"
+
 type PropertiesStore struct {
 	mu sync.Mutex
 	db *sql.DB
@@ -34,28 +35,22 @@ func NewPropertiesStore(storageDir string) (*PropertiesStore, error) {
 	normalized := filepath.FromSlash(strings.ReplaceAll(storageDir, `\`, `/`))
 	dbPath := filepath.Join(normalized, "properties.db")
 
-	db, err := sql.Open("sqlite", dbPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open properties database: %w", err)
-	}
-
-	s := &PropertiesStore{db: db}
-	if err := s.ensureSchema(); err != nil {
-		_ = db.Close()
-		if !sqliteutil.IsSQLiteRecoverableError(err) {
-			return nil, err
-		}
-		slog.Default().Warn("properties database corrupt, removing and retrying", "error", err)
-		sqliteutil.RemoveSQLiteFiles(dbPath)
-		db, err = sql.Open("sqlite", dbPath)
+	s := &PropertiesStore{}
+	err := sqliteutil.RetryOnCorruption(dbPath, func() error {
+		db, err := sql.Open("sqlite", dbPath+"?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)")
 		if err != nil {
-			return nil, fmt.Errorf("failed to reopen properties database after recovery: %w", err)
+			return fmt.Errorf("failed to open properties database: %w", err)
 		}
-		s = &PropertiesStore{db: db}
-		if err = s.ensureSchema(); err != nil {
+		s.db = db
+		if err := s.ensureSchema(); err != nil {
 			_ = db.Close()
-			return nil, err
+			s.db = nil
+			return err
 		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	return s, nil
 }
@@ -149,7 +144,7 @@ func (s *PropertiesStore) GetAllPropertyKeys(filter string, limit int) ([]Proper
 	if err != nil {
 		return nil, err
 	}
-	defer shared.LogClose(rows.Close, "could not close rows")
+	defer shared.LogClose(rows.Close, logCloseRowsFailed)
 
 	var result []PropertyKeyCount
 	for rows.Next() {
@@ -174,7 +169,7 @@ func (s *PropertiesStore) GetPageIDsByProperty(key, value string) ([]string, err
 	if err != nil {
 		return nil, err
 	}
-	defer shared.LogClose(rows.Close, "could not close rows")
+	defer shared.LogClose(rows.Close, logCloseRowsFailed)
 
 	var pageIDs []string
 	for rows.Next() {
@@ -210,7 +205,7 @@ func (s *PropertiesStore) GetPropertiesForPages(pageIDs []string) (map[string]ma
 	if err != nil {
 		return nil, err
 	}
-	defer shared.LogClose(rows.Close, "could not close rows")
+	defer shared.LogClose(rows.Close, logCloseRowsFailed)
 
 	result := make(map[string]map[string]PropertyEntry)
 	for rows.Next() {

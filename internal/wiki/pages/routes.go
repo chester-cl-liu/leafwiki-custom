@@ -13,7 +13,12 @@ import (
 	httpinternal "github.com/perber/wiki/internal/http"
 	"github.com/perber/wiki/internal/http/dto"
 	authmw "github.com/perber/wiki/internal/http/middleware/auth"
-	"github.com/perber/wiki/internal/http/middleware/security"
+)
+
+const (
+	pagesIdRoutePath         = "/pages/:id"
+	errInvalidRequestUserMsg = "Invalid request"
+	errInvalidRequestLogMsg  = "invalid request"
 )
 
 // Routes is the RouteRegistrar for the pages domain.
@@ -35,6 +40,10 @@ type Routes struct {
 	suggestSlug      *SuggestSlugUseCase
 	previewRefactor  *PreviewPageRefactorUseCase
 	applyRefactor    *ApplyPageRefactorUseCase
+	pinPage          *PinPageUseCase
+	addFavorite      *AddFavoriteUseCase
+	removeFavorite   *RemoveFavoriteUseCase
+	listFavorites    *ListFavoritesUseCase
 	userResolver     *coreauth.UserResolver
 	authService      *coreauth.AuthService
 }
@@ -58,6 +67,10 @@ type RoutesConfig struct {
 	SuggestSlug      *SuggestSlugUseCase
 	PreviewRefactor  *PreviewPageRefactorUseCase
 	ApplyRefactor    *ApplyPageRefactorUseCase
+	PinPage          *PinPageUseCase
+	AddFavorite      *AddFavoriteUseCase
+	RemoveFavorite   *RemoveFavoriteUseCase
+	ListFavorites    *ListFavoritesUseCase
 	UserResolver     *coreauth.UserResolver
 	AuthService      *coreauth.AuthService
 }
@@ -82,6 +95,10 @@ func NewRoutes(cfg RoutesConfig) *Routes {
 		suggestSlug:      cfg.SuggestSlug,
 		previewRefactor:  cfg.PreviewRefactor,
 		applyRefactor:    cfg.ApplyRefactor,
+		pinPage:          cfg.PinPage,
+		addFavorite:      cfg.AddFavorite,
+		removeFavorite:   cfg.RemoveFavorite,
+		listFavorites:    cfg.ListFavorites,
 		userResolver:     cfg.UserResolver,
 		authService:      cfg.AuthService,
 	}
@@ -91,38 +108,32 @@ func NewRoutes(cfg RoutesConfig) *Routes {
 func (r *Routes) RegisterRoutes(ctx httpinternal.RouterContext) {
 	opts := ctx.Opts
 
-	if opts.PublicAccess {
-		pub := ctx.Base.Group("/api")
-		pub.GET("/tree", r.handleGetTree)
-		pub.GET("/pages/by-path", r.handleGetByPath)
-		pub.GET("/pages/by-title", r.handleFindByTitle)
-		pub.GET("/pages/lookup", r.handleLookupPath)
-		pub.GET("/pages/permalink/:id", r.handleResolvePermalink)
-		pub.GET("/pages/:id", r.handleGetPage)
-	}
+	// Read routes registered once, gated per request so they can flip between
+	// authenticated-only and public without a restart (see APIReadGroup).
+	readGroup := ctx.APIReadGroup(r.authService)
+	readGroup.GET("/tree", r.handleGetTree)
+	readGroup.GET(pagesIdRoutePath, r.handleGetPage)
+	readGroup.GET("/pages/lookup", r.handleLookupPath)
+	readGroup.GET("/pages/by-path", r.handleGetByPath)
+	readGroup.GET("/pages/by-title", r.handleFindByTitle)
+	readGroup.GET("/pages/permalink/:id", r.handleResolvePermalink)
 
-	authGroup := ctx.Base.Group("/api")
-	authGroup.Use(
-		authmw.InjectPublicEditor(opts.AuthDisabled),
-		authmw.RequireAuth(r.authService, ctx.AuthCookies, opts.AuthDisabled),
-		security.CSRFMiddleware(ctx.CSRFCookie),
-	)
-
-	if !opts.PublicAccess {
-		authGroup.GET("/tree", r.handleGetTree)
-		authGroup.GET("/pages/:id", r.handleGetPage)
-		authGroup.GET("/pages/lookup", r.handleLookupPath)
-		authGroup.GET("/pages/by-path", r.handleGetByPath)
-		authGroup.GET("/pages/by-title", r.handleFindByTitle)
-		authGroup.GET("/pages/permalink/:id", r.handleResolvePermalink)
-	}
+	// Everything below needs a real authenticated user regardless of public
+	// mode (writes, editor-gated reads, per-user favorites).
+	authGroup := ctx.APIAuthGroup(r.authService)
 
 	authGroup.GET("/pages/slug-suggestion", authmw.RequireEditorOrAdmin(), r.handleSuggestSlug)
 	authGroup.POST("/pages", authmw.RequireEditorOrAdmin(), r.handleCreate)
-	authGroup.PUT("/pages/:id", authmw.RequireEditorOrAdmin(), r.handleUpdate)
-	authGroup.DELETE("/pages/:id", authmw.RequireEditorOrAdmin(), r.handleDelete)
+	authGroup.PUT(pagesIdRoutePath, authmw.RequireEditorOrAdmin(), r.handleUpdate)
+	authGroup.DELETE(pagesIdRoutePath, authmw.RequireEditorOrAdmin(), r.handleDelete)
 	authGroup.PUT("/pages/:id/move", authmw.RequireEditorOrAdmin(), r.handleMove)
 	authGroup.PUT("/pages/:id/sort", authmw.RequireEditorOrAdmin(), r.handleSort)
+	authGroup.PUT("/pages/:id/pin", authmw.RequireEditorOrAdmin(), r.handlePin)
+	// Favorites are a personal bookmark, not an editorial action — any
+	// authenticated user (already enforced by authGroup) may set their own.
+	authGroup.PUT("/pages/:id/favorite", r.handleAddFavorite)
+	authGroup.DELETE("/pages/:id/favorite", r.handleRemoveFavorite)
+	authGroup.GET("/favorites", r.handleListFavorites)
 	authGroup.POST("/pages/ensure", authmw.RequireEditorOrAdmin(), r.handleEnsurePath)
 	authGroup.POST("/pages/convert/:id", authmw.RequireEditorOrAdmin(), r.handleConvert)
 	authGroup.POST("/pages/copy/:id", authmw.RequireEditorOrAdmin(), r.handleCopy)
@@ -236,7 +247,7 @@ func (r *Routes) handleCreate(c *gin.Context) {
 		Kind     *string `json:"kind"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		respondWithPageStatusError(c, http.StatusBadRequest, ErrCodePageInvalidRequest, "Invalid request", "invalid request")
+		respondWithPageStatusError(c, http.StatusBadRequest, ErrCodePageInvalidRequest, errInvalidRequestUserMsg, errInvalidRequestLogMsg)
 		return
 	}
 	user := authmw.MustGetUser(c)
@@ -265,7 +276,7 @@ func (r *Routes) handleUpdate(c *gin.Context) {
 		Properties map[string]string `json:"properties"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		respondWithPageStatusError(c, http.StatusBadRequest, ErrCodePageInvalidRequest, "Invalid request", "invalid request")
+		respondWithPageStatusError(c, http.StatusBadRequest, ErrCodePageInvalidRequest, errInvalidRequestUserMsg, errInvalidRequestLogMsg)
 		return
 	}
 	if err := validatePageMetadataInput(req.Tags, req.Properties); err != nil {
@@ -277,43 +288,25 @@ func (r *Routes) handleUpdate(c *gin.Context) {
 		return
 	}
 
-	contentToSave := req.Content
-	fromImport := false
-	if req.Content != nil {
-		extraFields := buildExtraFields(req.Tags, req.Properties)
-		combined, err := markdown.BuildMarkdownWithExtraFrontmatter(extraFields, *req.Content)
-		if err != nil {
-			respondWithPageStatusError(c, http.StatusInternalServerError, ErrCodePageInternalError, "Failed to build frontmatter", "failed to build frontmatter")
-			return
-		}
-		contentToSave = &combined
-		fromImport = true
+	// Normalize tags to lowercase so the on-disk file is always consistent with
+	// what the search index stores. Preserve nil so callers can distinguish
+	// "no tags field" (nil → preserve existing) from "empty tags" (non-nil).
+	normalizedTags := req.Tags
+	if req.Tags != nil {
+		normalizedTags = normalizeTagInputs(req.Tags)
 	}
 
 	kind := tree.NodeKindPage
 	out, err := r.updatePage.Execute(c.Request.Context(), UpdatePageInput{
 		UserID: user.ID, ID: id, Version: req.Version, Title: req.Title, Slug: req.Slug,
-		Content: contentToSave, Kind: &kind, FromImport: fromImport,
+		Content: req.Content, Kind: &kind,
+		Tags: normalizedTags, Properties: req.Properties,
 	})
 	if err != nil {
 		respondWithPageError(c, err)
 		return
 	}
 	r.respondPage(c, http.StatusOK, out.Page)
-}
-
-func buildExtraFields(tags []string, properties map[string]string) map[string]interface{} {
-	extra := make(map[string]interface{}, len(properties)+1)
-	for k, v := range properties {
-		extra[k] = v
-	}
-	normalizedTags := normalizeTagInputs(tags)
-	list := make([]interface{}, len(normalizedTags))
-	for i, t := range normalizedTags {
-		list[i] = t
-	}
-	extra["tags"] = list
-	return extra
 }
 
 func (r *Routes) handleDelete(c *gin.Context) {
@@ -338,6 +331,7 @@ func (r *Routes) handleMove(c *gin.Context) {
 	var req struct {
 		Version  string `json:"version" binding:"required"`
 		ParentID string `json:"parentId"`
+		Position *int   `json:"position"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		respondWithPageStatusError(c, http.StatusBadRequest, ErrCodePageInvalidPayload, "Invalid payload", "invalid payload")
@@ -348,7 +342,7 @@ func (r *Routes) handleMove(c *gin.Context) {
 		return
 	}
 	if err := r.movePage.Execute(c.Request.Context(), MovePageInput{
-		UserID: user.ID, ID: id, Version: req.Version, ParentID: req.ParentID,
+		UserID: user.ID, ID: id, Version: req.Version, ParentID: req.ParentID, Position: req.Position,
 	}); err != nil {
 		respondWithPageError(c, err)
 		return
@@ -362,7 +356,7 @@ func (r *Routes) handleSort(c *gin.Context) {
 		OrderedIDs []string `json:"orderedIds"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		respondWithPageStatusError(c, http.StatusBadRequest, ErrCodePageInvalidRequest, "Invalid request", "invalid request")
+		respondWithPageStatusError(c, http.StatusBadRequest, ErrCodePageInvalidRequest, errInvalidRequestUserMsg, errInvalidRequestLogMsg)
 		return
 	}
 	if err := r.sortPages.Execute(c.Request.Context(), SortPagesInput{
@@ -374,6 +368,77 @@ func (r *Routes) handleSort(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "Pages sorted successfully"})
 }
 
+func (r *Routes) handlePin(c *gin.Context) {
+	id := strings.TrimSpace(c.Param("id"))
+	var req struct {
+		Version string `json:"version" binding:"required"`
+		Pinned  bool   `json:"pinned"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		respondWithPageStatusError(c, http.StatusBadRequest, ErrCodePageInvalidRequest, errInvalidRequestUserMsg, errInvalidRequestLogMsg)
+		return
+	}
+	out, err := r.pinPage.Execute(c.Request.Context(), PinPageInput{
+		ID:      id,
+		Version: req.Version,
+		Pinned:  req.Pinned,
+	})
+	if err != nil {
+		respondWithPageError(c, err)
+		return
+	}
+	r.respondPage(c, http.StatusOK, out.Page)
+}
+
+func (r *Routes) handleAddFavorite(c *gin.Context) {
+	id := strings.TrimSpace(c.Param("id"))
+	user := authmw.MustGetUser(c)
+	if user == nil {
+		return
+	}
+	if err := r.addFavorite.Execute(c.Request.Context(), AddFavoriteInput{
+		UserID: user.ID, PageID: id,
+	}); err != nil {
+		respondWithPageError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"message": "Page favorited"})
+}
+
+func (r *Routes) handleRemoveFavorite(c *gin.Context) {
+	id := strings.TrimSpace(c.Param("id"))
+	user := authmw.MustGetUser(c)
+	if user == nil {
+		return
+	}
+	if err := r.removeFavorite.Execute(c.Request.Context(), RemoveFavoriteInput{
+		UserID: user.ID, PageID: id,
+	}); err != nil {
+		respondWithPageError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"message": "Page unfavorited"})
+}
+
+func (r *Routes) handleListFavorites(c *gin.Context) {
+	user := authmw.MustGetUser(c)
+	if user == nil {
+		return
+	}
+	out, err := r.listFavorites.Execute(c.Request.Context(), ListFavoritesInput{UserID: user.ID})
+	if err != nil {
+		respondWithPageError(c, err)
+		return
+	}
+	apiPages := make([]*dto.Page, 0, len(out.Pages))
+	for _, p := range out.Pages {
+		apiPage := dto.ToAPIPage(p, r.userResolver)
+		r.enrichPageMetadata(apiPage)
+		apiPages = append(apiPages, apiPage)
+	}
+	c.JSON(http.StatusOK, gin.H{"pages": apiPages})
+}
+
 func (r *Routes) handleEnsurePath(c *gin.Context) {
 	var req struct {
 		Path  string  `json:"path" binding:"required"`
@@ -381,7 +446,7 @@ func (r *Routes) handleEnsurePath(c *gin.Context) {
 		Kind  *string `json:"kind"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		respondWithPageStatusError(c, http.StatusBadRequest, ErrCodePageInvalidRequest, "Invalid request", "invalid request")
+		respondWithPageStatusError(c, http.StatusBadRequest, ErrCodePageInvalidRequest, errInvalidRequestUserMsg, errInvalidRequestLogMsg)
 		return
 	}
 	user := authmw.MustGetUser(c)
@@ -406,7 +471,7 @@ func (r *Routes) handleConvert(c *gin.Context) {
 		Version string `json:"version" binding:"required"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		respondWithPageStatusError(c, http.StatusBadRequest, ErrCodePageInvalidRequest, "Invalid request", "invalid request")
+		respondWithPageStatusError(c, http.StatusBadRequest, ErrCodePageInvalidRequest, errInvalidRequestUserMsg, errInvalidRequestLogMsg)
 		return
 	}
 	if req.Kind != "page" && req.Kind != "section" {
@@ -434,7 +499,7 @@ func (r *Routes) handleCopy(c *gin.Context) {
 		Slug     string  `json:"slug" binding:"required"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		respondWithPageStatusError(c, http.StatusBadRequest, ErrCodePageInvalidRequest, "Invalid request", "invalid request")
+		respondWithPageStatusError(c, http.StatusBadRequest, ErrCodePageInvalidRequest, errInvalidRequestUserMsg, errInvalidRequestLogMsg)
 		return
 	}
 	user := authmw.MustGetUser(c)
@@ -462,7 +527,7 @@ func (r *Routes) handleRefactorPreview(c *gin.Context) {
 		NewParentID *string `json:"parentId"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		respondWithPageStatusError(c, http.StatusBadRequest, ErrCodePageInvalidRequest, "Invalid request", "invalid request")
+		respondWithPageStatusError(c, http.StatusBadRequest, ErrCodePageInvalidRequest, errInvalidRequestUserMsg, errInvalidRequestLogMsg)
 		return
 	}
 	out, err := r.previewRefactor.Execute(c.Request.Context(), RefactorPreviewInput{
@@ -486,9 +551,10 @@ func (r *Routes) handleRefactorApply(c *gin.Context) {
 		Content      *string `json:"content"`
 		NewParentID  *string `json:"parentId"`
 		RewriteLinks bool    `json:"rewriteLinks"`
+		Position     *int    `json:"position"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		respondWithPageStatusError(c, http.StatusBadRequest, ErrCodePageInvalidRequest, "Invalid request", "invalid request")
+		respondWithPageStatusError(c, http.StatusBadRequest, ErrCodePageInvalidRequest, errInvalidRequestUserMsg, errInvalidRequestLogMsg)
 		return
 	}
 	user := authmw.MustGetUser(c)
@@ -503,6 +569,7 @@ func (r *Routes) handleRefactorApply(c *gin.Context) {
 			Content: req.Content, NewParentID: req.NewParentID,
 		},
 		RewriteLinks: req.RewriteLinks,
+		Position:     req.Position,
 	})
 	if err != nil {
 		respondWithPageError(c, err)
@@ -546,11 +613,6 @@ func (r *Routes) enrichPageMetadata(page *dto.Page) {
 	page.Properties = properties
 }
 
-var reservedPropertyKeys = map[string]struct{}{
-	"tags":  {},
-	"title": {},
-}
-
 func extractPageMetadata(fields map[string]interface{}) ([]string, map[string]string) {
 	tags := []string{}
 	properties := map[string]string{}
@@ -563,11 +625,7 @@ func extractPageMetadata(fields map[string]interface{}) ([]string, map[string]st
 			tags = normalizeMetadataTags(value)
 			continue
 		}
-
-		if _, reserved := reservedPropertyKeys[lower]; reserved {
-			continue
-		}
-		if strings.HasPrefix(lower, "leafwiki_") {
+		if markdown.IsSystemKey(key) {
 			continue
 		}
 
@@ -679,9 +737,7 @@ func validatePageMetadataInput(tags []string, properties map[string]string) erro
 			ve.Add(field, "Property key must not be empty")
 		case key != rawKey:
 			ve.Add(field, "Property key must not contain leading or trailing whitespace")
-		case strings.HasPrefix(strings.ToLower(key), "leafwiki_"):
-			ve.Add(field, "Property key uses a reserved prefix")
-		case strings.ToLower(key) == "tags" || strings.ToLower(key) == "title":
+		case markdown.IsSystemKey(key):
 			ve.Add(field, "Property key is reserved")
 		}
 	}

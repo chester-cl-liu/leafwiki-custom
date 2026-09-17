@@ -57,7 +57,7 @@ func (f *fakeExecWiki) UpdatePage(userID string, id, title, slug string, content
 		return f.updateFn(userID, id, title, slug, content, kind)
 	}
 	// simulate tree change
-	f.hash = f.hash + "-changed"
+	f.hash += "-changed"
 	return &tree.Page{PageNode: &tree.PageNode{ID: id, Title: title, Slug: slug, Kind: *kind}}, nil
 }
 
@@ -149,9 +149,6 @@ func TestExecutor_Create_HappyPath_PreservesNonInternalFrontmatter(t *testing.T)
 	}
 	if strings.Contains(*w.lastUpdatedContent, "leafwiki_id: source-id") {
 		t.Fatalf("expected source leafwiki_id to be dropped, got: %q", *w.lastUpdatedContent)
-	}
-	if strings.Contains(*w.lastUpdatedContent, "leafwiki_title: Source Title") {
-		t.Fatalf("expected source leafwiki_title to be dropped, got: %q", *w.lastUpdatedContent)
 	}
 
 	if res.TreeHashBefore != "h1" {
@@ -349,7 +346,7 @@ func TestExecutor_Create_RewritesMarkdownAndWikiLinksToImportedPages(t *testing.
 		if content != nil {
 			updatedContentByTitle[title] = *content
 		}
-		w.hash = w.hash + "-changed"
+		w.hash += "-changed"
 		return &tree.Page{PageNode: &tree.PageNode{ID: id, Title: title, Slug: slug, Kind: *kind}}, nil
 	}
 	plan := &PlanResult{
@@ -377,7 +374,7 @@ func TestExecutor_Create_RewritesMarkdownAndWikiLinksToImportedPages(t *testing.
 		"[Absolute](/guides)",
 		"[RouteStyle](/reference/endpoints)",
 		"[Container](/guides)",
-		"[API Alias](/reference/endpoints)",
+		"[[reference/endpoints|API Alias]]",
 	} {
 		if !strings.Contains(setupContent, expected) {
 			t.Fatalf("expected rewritten content to contain %q, got:\n%s", expected, setupContent)
@@ -485,7 +482,7 @@ func TestExecutor_Create_WikiLinkFallsBackToUniqueNestedBasenameOnly(t *testing.
 		if content != nil {
 			updatedContentByTitle[title] = *content
 		}
-		w.hash = w.hash + "-changed"
+		w.hash += "-changed"
 		return &tree.Page{PageNode: &tree.PageNode{ID: id, Title: title, Slug: slug, Kind: *kind}}, nil
 	}
 
@@ -506,8 +503,8 @@ func TestExecutor_Create_WikiLinkFallsBackToUniqueNestedBasenameOnly(t *testing.
 	}
 
 	homeContent := updatedContentByTitle["Home"]
-	if !strings.Contains(homeContent, "[Brainstorm](/daily/brainstorm)") {
-		t.Fatalf("expected unique basename wiki link rewrite, got:\n%s", homeContent)
+	if !strings.Contains(homeContent, "[[Brainstorm]]") {
+		t.Fatalf("expected unique basename wiki link to stay as wikilink, got:\n%s", homeContent)
 	}
 	if !strings.Contains(homeContent, "[[Meeting Notes]]") {
 		t.Fatalf("expected ambiguous basename wiki link to stay unchanged, got:\n%s", homeContent)
@@ -530,7 +527,7 @@ func TestExecutor_Create_WikiLinkResolvesUniqueNestedPathSuffix(t *testing.T) {
 		if content != nil {
 			updatedContentByTitle[title] = *content
 		}
-		w.hash = w.hash + "-changed"
+		w.hash += "-changed"
 		return &tree.Page{PageNode: &tree.PageNode{ID: id, Title: title, Slug: slug, Kind: *kind}}, nil
 	}
 
@@ -549,12 +546,12 @@ func TestExecutor_Create_WikiLinkResolvesUniqueNestedPathSuffix(t *testing.T) {
 	}
 
 	statefulSetContent := updatedContentByTitle["StatefulSet"]
-	if !strings.Contains(statefulSetContent, "[Deployment](/knowledge-main/tools/kubernetes/resources/deployment)") {
-		t.Fatalf("expected unique nested path suffix wiki link rewrite, got:\n%s", statefulSetContent)
+	if !strings.Contains(statefulSetContent, "[[knowledge-main/tools/kubernetes/resources/deployment|Deployment]]") {
+		t.Fatalf("expected unique nested path suffix wiki link to stay as wikilink, got:\n%s", statefulSetContent)
 	}
 }
 
-func TestExecutor_Create_UnresolvedWikiLinkFallsBackToDeadMarkdownLink(t *testing.T) {
+func TestExecutor_Create_UnresolvedWikiLinkStaysAsWikiLink(t *testing.T) {
 	tmp := t.TempDir()
 	writeTmp(t, tmp, "Home.md", strings.Join([]string{
 		"# Home",
@@ -569,7 +566,7 @@ func TestExecutor_Create_UnresolvedWikiLinkFallsBackToDeadMarkdownLink(t *testin
 		if content != nil {
 			updatedContentByTitle[title] = *content
 		}
-		w.hash = w.hash + "-changed"
+		w.hash += "-changed"
 		return &tree.Page{PageNode: &tree.PageNode{ID: id, Title: title, Slug: slug, Kind: *kind}}, nil
 	}
 
@@ -587,8 +584,8 @@ func TestExecutor_Create_UnresolvedWikiLinkFallsBackToDeadMarkdownLink(t *testin
 	}
 
 	homeContent := updatedContentByTitle["Home"]
-	if !strings.Contains(homeContent, "[Missing Note](/missing-note)") {
-		t.Fatalf("expected unresolved wiki link fallback to dead markdown link, got:\n%s", homeContent)
+	if !strings.Contains(homeContent, "[[Missing Note]]") {
+		t.Fatalf("expected unresolved wiki link to stay as wikilink, got:\n%s", homeContent)
 	}
 }
 
@@ -616,7 +613,7 @@ func TestExecutor_Create_DoesNotRewriteLinksInsideCode(t *testing.T) {
 		if content != nil {
 			updatedContentByTitle[title] = *content
 		}
-		w.hash = w.hash + "-changed"
+		w.hash += "-changed"
 		return &tree.Page{PageNode: &tree.PageNode{ID: id, Title: title, Slug: slug, Kind: *kind}}, nil
 	}
 
@@ -640,7 +637,7 @@ func TestExecutor_Create_DoesNotRewriteLinksInsideCode(t *testing.T) {
 		"[Fence](../Reference/Endpoints.md)",
 		"[[Reference/Endpoints|Fence Alias]]",
 		"[Real](/reference/endpoints)",
-		"[Real Alias](/reference/endpoints)",
+		"[[reference/endpoints|Real Alias]]",
 	} {
 		if !strings.Contains(setupContent, expected) {
 			t.Fatalf("expected content to contain %q, got:\n%s", expected, setupContent)
@@ -666,7 +663,7 @@ func TestExecutor_Create_RewritesWindowsStyleMarkdownAndAssetPaths(t *testing.T)
 		if content != nil {
 			updatedContentByTitle[title] = *content
 		}
-		w.hash = w.hash + "-changed"
+		w.hash += "-changed"
 		return &tree.Page{PageNode: &tree.PageNode{ID: id, Title: title, Slug: slug, Kind: *kind}}, nil
 	}
 

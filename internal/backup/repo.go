@@ -1,27 +1,54 @@
 package backup
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	gogit "github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/config"
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/object"
-	"github.com/go-git/go-git/v5/plumbing/transport/ssh"
-	sshcrypto "golang.org/x/crypto/ssh"
+	"github.com/go-git/go-git/v5/plumbing/storer"
+	"github.com/go-git/go-git/v5/plumbing/transport"
 )
+
+// gcLooseThreshold is the number of loose objects that triggers a gc() run.
+// git itself defaults to 6700; we use a lower value because the backup repo
+// accumulates objects predictably and we prefer smaller, more frequent packs.
+const (
+	gcLooseThreshold               = 500
+	networkTimeout                 = 2 * time.Minute
+	errWriteGitignoreFailed        = "failed to write .gitignore: %w"
+	errComputeRelativeRootFailed   = "failed to compute relative path for root: %w"
+	errComputeRelativeAssetsFailed = "failed to compute relative path for assets: %w"
+	errStageRootDirFailed          = "failed to stage root dir: %w"
+	errStageAssetsDirFailed        = "failed to stage assets dir: %w"
+	errCommitFailed                = "failed to commit: %w"
+)
+
+// errRemoteBranchNotFound is returned by initWithRemoteHistory when the remote
+// repository has commits on other branches but not on cfg.Branch. The caller
+// (Init) treats it identically to transport.ErrEmptyRemoteRepository: initialise
+// a fresh local repo and let the first push create the branch.
+var errRemoteBranchNotFound = errors.New("remote branch not found")
 
 // Repository wraps a git repository with backup-specific state.
 type Repository struct {
-	cfg     Config
-	repoDir string
-	repo    *gogit.Repository
-	status  *Status
+	mu               sync.Mutex // serialises RunBackup and ForcePush so the HTTP handler can't race the scheduler goroutine
+	cfg              Config
+	repoDir          string
+	repo             *gogit.Repository
+	status           *Status
+	looseObjsSinceGC int
+	lastPushedHash   plumbing.Hash // hash of the last commit successfully pushed; zero = never pushed
 }
 
 // Init opens an existing repo at repoDir or initialises a new one.
@@ -41,7 +68,7 @@ func Init(cfg Config) (*Repository, error) {
 	}
 
 	repoDir := filepath.Dir(filepath.Clean(cfg.RootDir))
-	slog.Debug("backup init started", "repoDir", repoDir, "rootDir", cfg.RootDir, "assetsDir", cfg.AssetsDir, "remote", cfg.RemoteURL, "branch", cfg.Branch)
+	slog.Info("backup: initializing", "repoDir", repoDir, "remote", redactRemote(cfg.RemoteURL), "branch", cfg.Branch, "interval", cfg.Interval)
 
 	// Ensure parent directory exists
 	if err := os.MkdirAll(repoDir, 0755); err != nil {
@@ -59,26 +86,70 @@ func Init(cfg Config) (*Repository, error) {
 	if err == nil {
 		slog.Debug("opened existing git repo", "repoDir", repoDir)
 		r.repo = repo
+		if err := r.migrateBranchName(); err != nil {
+			return nil, err
+		}
 		if cfg.RemoteURL != "" {
 			if err := r.reconcileRemote(); err != nil {
 				return nil, err
 			}
+		}
+		// Ensure .gitignore exists even for repos created before this feature
+		// was added, or if it was manually deleted.
+		if err := EnsureGitignore(repoDir); err != nil {
+			return nil, fmt.Errorf(errWriteGitignoreFailed, err)
 		}
 		return r, nil
 	}
 
 	slog.Debug("no existing repo found, initialising new one", "repoDir", repoDir, "openErr", err)
 
-	// Initialize new repo
-	repo, err = gogit.PlainInit(repoDir, false)
+	// If a remote is configured, fetch the remote history before initialising so
+	// the local repo shares ancestry with the remote. This avoids the
+	// unrelated-histories / NeedsIntervention trap when the .git folder was deleted
+	// while the remote already has content.
+	//
+	// We deliberately do NOT clone (PlainClone checks out the remote's files,
+	// which would overwrite local wiki content with an older remote version).
+	// Instead we init + fetch + repoint the local branch — the working tree is
+	// never touched, so no local data is lost.
+	if cfg.RemoteURL != "" {
+		fetched, fetchErr := r.initWithRemoteHistory(repoDir)
+		if fetchErr == nil {
+			slog.Info("backup: adopted remote history without touching local files", "remote", redactRemote(cfg.RemoteURL), "branch", cfg.Branch)
+			r.repo = fetched
+			// Mark remote HEAD as already-pushed; first RunBackup will only push
+			// genuinely new local changes on top of the fetched history.
+			if head, hErr := fetched.Head(); hErr == nil {
+				r.lastPushedHash = head.Hash()
+			}
+			if err := EnsureGitignore(repoDir); err != nil {
+				return nil, fmt.Errorf(errWriteGitignoreFailed, err)
+			}
+			return r, nil
+		}
+		if !errors.Is(fetchErr, transport.ErrEmptyRemoteRepository) && !errors.Is(fetchErr, errRemoteBranchNotFound) {
+			return nil, fmt.Errorf("failed to fetch remote history from %s: %w", redactRemote(cfg.RemoteURL), fetchErr)
+		}
+		// initWithRemoteHistory created a partial .git — remove it before plain init.
+		_ = os.RemoveAll(filepath.Join(repoDir, ".git"))
+		slog.Info("backup: remote empty or branch missing, initialising local repo", "remote", redactRemote(cfg.RemoteURL))
+	}
+
+	// Initialize new repo with the configured branch name so local and remote
+	// branch names always match — go-git's PlainInit defaults to "master".
+	targetBranch := plumbing.NewBranchReferenceName(cfg.Branch)
+	repo, err = gogit.PlainInitWithOptions(repoDir, &gogit.PlainInitOptions{
+		InitOptions: gogit.InitOptions{DefaultBranch: targetBranch},
+	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to init repo: %w", err)
 	}
-	slog.Debug("new git repo initialised", "repoDir", repoDir)
+	slog.Debug("new git repo initialised", "repoDir", repoDir, "branch", cfg.Branch)
 	r.repo = repo
 
 	if err := EnsureGitignore(repoDir); err != nil {
-		return nil, fmt.Errorf("failed to write .gitignore: %w", err)
+		return nil, fmt.Errorf(errWriteGitignoreFailed, err)
 	}
 
 	// Create initial commit with root/ and assets/ if they exist
@@ -110,7 +181,136 @@ func (r *Repository) reconcileRemote() error {
 	}); err != nil {
 		return fmt.Errorf("failed to update remote URL: %w", err)
 	}
-	slog.Info("backup: updated 'origin' remote URL", "url", r.cfg.RemoteURL)
+	slog.Info("backup: updated 'origin' remote URL", "url", r.remoteForLog())
+	return nil
+}
+
+// initWithRemoteHistory initialises a fresh git repo at repoDir, fetches the
+// remote history into it, and repoints the local branch at the remote HEAD —
+// without touching the working tree. Local wiki files are never overwritten.
+// Returns transport.ErrEmptyRemoteRepository when the remote has no commits yet.
+func (r *Repository) initWithRemoteHistory(repoDir string) (*gogit.Repository, error) {
+	gitDir := filepath.Join(repoDir, ".git")
+
+	// Clean up the .git directory on any failure so the caller's fallback path
+	// (PlainInitWithOptions) never hits "repository already exists".
+	var repo *gogit.Repository
+	var returnErr error
+	defer func() {
+		if returnErr != nil {
+			_ = os.RemoveAll(gitDir)
+		}
+	}()
+
+	targetBranch := plumbing.NewBranchReferenceName(r.cfg.Branch)
+
+	repo, returnErr = gogit.PlainInitWithOptions(repoDir, &gogit.PlainInitOptions{
+		InitOptions: gogit.InitOptions{DefaultBranch: targetBranch},
+	})
+	if returnErr != nil {
+		returnErr = fmt.Errorf("initWithRemoteHistory: init: %w", returnErr)
+		return nil, returnErr
+	}
+
+	if _, returnErr = repo.CreateRemote(&config.RemoteConfig{
+		Name: "origin",
+		URLs: []string{r.cfg.RemoteURL},
+	}); returnErr != nil {
+		returnErr = fmt.Errorf("initWithRemoteHistory: create remote: %w", returnErr)
+		return nil, returnErr
+	}
+
+	auth, returnErr := r.buildAuth()
+	if returnErr != nil {
+		returnErr = fmt.Errorf("initWithRemoteHistory: auth: %w", returnErr)
+		return nil, returnErr
+	}
+
+	remote, _ := repo.Remote("origin")
+	listCtx, listCancel := context.WithTimeout(context.Background(), networkTimeout)
+	defer listCancel()
+	refs, err := remote.ListContext(listCtx, &gogit.ListOptions{Auth: auth})
+	if err != nil {
+		returnErr = fmt.Errorf("initWithRemoteHistory: list remote: %w", err)
+		return nil, returnErr
+	}
+
+	// Find the remote branch HEAD hash.
+	var remoteHead plumbing.Hash
+	for _, ref := range refs {
+		if ref.Name() == targetBranch {
+			remoteHead = ref.Hash()
+			break
+		}
+	}
+	if remoteHead.IsZero() {
+		if len(refs) == 0 {
+			returnErr = transport.ErrEmptyRemoteRepository
+		} else {
+			slog.Info("backup: target branch not found on remote, will be created on first push", "branch", r.cfg.Branch)
+			returnErr = fmt.Errorf("%w %q", errRemoteBranchNotFound, r.cfg.Branch)
+		}
+		return nil, returnErr
+	}
+
+	// Fetch only the target branch so we get the full object graph.
+	refSpec := config.RefSpec("refs/heads/" + r.cfg.Branch + ":refs/heads/" + r.cfg.Branch)
+	fetchCtx, fetchCancel := context.WithTimeout(context.Background(), networkTimeout)
+	defer fetchCancel()
+	if err := remote.FetchContext(fetchCtx, &gogit.FetchOptions{
+		Auth:     auth,
+		RefSpecs: []config.RefSpec{refSpec},
+	}); err != nil && !errors.Is(err, gogit.NoErrAlreadyUpToDate) {
+		returnErr = fmt.Errorf("initWithRemoteHistory: fetch: %w", err)
+		return nil, returnErr
+	}
+
+	// Repoint HEAD → local branch → remote HEAD commit (no checkout).
+	if err := repo.Storer.SetReference(plumbing.NewHashReference(targetBranch, remoteHead)); err != nil {
+		returnErr = fmt.Errorf("initWithRemoteHistory: set branch ref: %w", err)
+		return nil, returnErr
+	}
+	if err := repo.Storer.SetReference(plumbing.NewSymbolicReference(plumbing.HEAD, targetBranch)); err != nil {
+		returnErr = fmt.Errorf("initWithRemoteHistory: set HEAD: %w", err)
+		return nil, returnErr
+	}
+
+	return repo, nil
+}
+
+// migrateBranchName renames the local branch to cfg.Branch when the repo was
+// previously initialised with a different default (e.g. go-git's "master").
+// This fixes the refSpec mismatch (refs/heads/master:refs/heads/main) that
+// caused every pull to return nil instead of NoErrAlreadyUpToDate, and
+// non-fast-forward push failures when the remote advanced between cycles.
+func (r *Repository) migrateBranchName() error {
+	head, err := r.repo.Head()
+	if err != nil {
+		// Empty repo or detached HEAD — nothing to rename yet.
+		return nil
+	}
+	if !head.Name().IsBranch() {
+		return nil
+	}
+	current := head.Name().Short()
+	if current == r.cfg.Branch {
+		return nil // already on the right branch
+	}
+	target := plumbing.NewBranchReferenceName(r.cfg.Branch)
+
+	// Create target branch ref pointing at the same commit.
+	if err := r.repo.Storer.SetReference(plumbing.NewHashReference(target, head.Hash())); err != nil {
+		return fmt.Errorf("migrateBranchName: failed to create %s ref: %w", r.cfg.Branch, err)
+	}
+	// Repoint HEAD to the new branch.
+	if err := r.repo.Storer.SetReference(plumbing.NewSymbolicReference(plumbing.HEAD, target)); err != nil {
+		return fmt.Errorf("migrateBranchName: failed to update HEAD: %w", err)
+	}
+	// Remove old branch ref.
+	if err := r.repo.Storer.RemoveReference(head.Name()); err != nil {
+		slog.Warn("migrateBranchName: could not remove old branch ref", "branch", current, "error", err)
+	}
+	slog.Info("backup: renamed local branch", "from", current, "to", r.cfg.Branch)
 	return nil
 }
 
@@ -126,11 +326,11 @@ func (r *Repository) makeInitialCommit() error {
 	// Compute relative paths from repo root
 	rootRel, err := filepath.Rel(r.repoDir, r.cfg.RootDir)
 	if err != nil {
-		return fmt.Errorf("failed to compute relative path for root: %w", err)
+		return fmt.Errorf(errComputeRelativeRootFailed, err)
 	}
 	assetsRel, err := filepath.Rel(r.repoDir, r.cfg.AssetsDir)
 	if err != nil {
-		return fmt.Errorf("failed to compute relative path for assets: %w", err)
+		return fmt.Errorf(errComputeRelativeAssetsFailed, err)
 	}
 	slog.Debug("makeInitialCommit: resolved relative paths", "rootRel", rootRel, "assetsRel", assetsRel)
 
@@ -143,7 +343,7 @@ func (r *Repository) makeInitialCommit() error {
 	if _, err := os.Stat(r.cfg.RootDir); err == nil {
 		slog.Debug("makeInitialCommit: staging root dir", "path", rootRel)
 		if _, err := wt.Add(filepath.ToSlash(rootRel)); err != nil {
-			return fmt.Errorf("failed to stage root dir: %w", err)
+			return fmt.Errorf(errStageRootDirFailed, err)
 		}
 		// Check if root has any files
 		if hasFilesFlag, err := hasFiles(r.cfg.RootDir); err == nil && hasFilesFlag {
@@ -161,7 +361,7 @@ func (r *Repository) makeInitialCommit() error {
 	if _, err := os.Stat(r.cfg.AssetsDir); err == nil {
 		slog.Debug("makeInitialCommit: staging assets dir", "path", assetsRel)
 		if _, err := wt.Add(filepath.ToSlash(assetsRel)); err != nil {
-			return fmt.Errorf("failed to stage assets dir: %w", err)
+			return fmt.Errorf(errStageAssetsDirFailed, err)
 		}
 		// Check if assets has any files
 		if hasFilesFlag, err := hasFiles(r.cfg.AssetsDir); err == nil && hasFilesFlag {
@@ -208,13 +408,13 @@ func (r *Repository) makeInitialCommit() error {
 		},
 	})
 	if err != nil {
-		return fmt.Errorf("failed to commit: %w", err)
+		return fmt.Errorf(errCommitFailed, err)
 	}
 	slog.Debug("makeInitialCommit: initial commit created", "hash", commit.String())
 
 	// Push to remote if configured
 	if r.cfg.RemoteURL != "" {
-		slog.Debug("makeInitialCommit: scheduling initial commit push to remote (scheduler will push on next cycle)", "remote", r.cfg.RemoteURL)
+		slog.Debug("makeInitialCommit: scheduling initial commit push to remote (scheduler will push on next cycle)", "remote", r.remoteForLog())
 	} else {
 		slog.Debug("makeInitialCommit: no remote configured, skipping push")
 	}
@@ -258,11 +458,51 @@ func hasStagedChanges(status gogit.Status) bool {
 	return false
 }
 
-// RunBackup stages all changes in root/ and assets/, commits if anything
-// changed, then pushes to the configured remote.
+// Pull fetches from the remote and fast-forward merges any new commits,
+// independent of a full backup cycle. Same error/conflict semantics as
+// pullBeforeBackup: conflicts and diverged history set r.status.NeedsIntervention,
+// transient errors set r.status.LastError. A no-op (nil error) if no remote is
+// configured. Fails fast (rather than blocking) if a backup cycle is already
+// running, mirroring ForcePush — RunBackup can hold the lock for minutes across
+// its own network pull/push, which would otherwise stall the HTTP request.
+func (r *Repository) Pull() error {
+	if !r.mu.TryLock() {
+		return fmt.Errorf("backup is currently running — try again in a moment")
+	}
+	defer r.mu.Unlock()
+
+	if r.cfg.RemoteURL == "" {
+		return nil
+	}
+
+	wt, err := r.repo.Worktree()
+	if err != nil {
+		errMsg := fmt.Errorf("failed to get worktree: %w", err).Error()
+		slog.Debug("Pull: failed to get worktree", "error", errMsg)
+		r.status.SetError(errMsg)
+		return fmt.Errorf("failed to get worktree: %w", err)
+	}
+
+	if err := r.pullBeforeBackup(wt); err != nil {
+		return err
+	}
+
+	// A successful pull resolves any stale error/conflict state from a prior
+	// cycle (e.g. the file conflict that caused it no longer exists on disk).
+	// Unlike SetSuccess, this must not touch LastBackupAt — a pull is not a
+	// backup, so it shouldn't be reported as one.
+	r.status.ClearIntervention()
+	return nil
+}
+
+// RunBackup pulls from the remote (fast-forward only) to integrate any external
+// commits, then stages all changes in root/ and assets/, commits if anything
+// changed, and pushes to the configured remote.
 // message format: "backup: <RFC3339 timestamp>"
 // Returns nil and skips commit+push if the working tree is clean.
 func (r *Repository) RunBackup() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	slog.Debug("RunBackup: starting backup cycle")
 
 	wt, err := r.repo.Worktree()
@@ -273,17 +513,26 @@ func (r *Repository) RunBackup() error {
 		return fmt.Errorf("failed to get worktree: %w", err)
 	}
 
+	// Pull remote changes before staging so our subsequent push is always a
+	// fast-forward. This handles the case where the remote was modified externally
+	// (e.g. a README committed via the GitHub UI).
+	if r.cfg.RemoteURL != "" {
+		if err := r.pullBeforeBackup(wt); err != nil {
+			return err
+		}
+	}
+
 	rootRel, err := filepath.Rel(r.repoDir, r.cfg.RootDir)
 	if err != nil {
-		errMsg := fmt.Errorf("failed to compute relative path for root: %w", err).Error()
+		errMsg := fmt.Errorf(errComputeRelativeRootFailed, err).Error()
 		r.status.SetError(errMsg)
-		return fmt.Errorf("failed to compute relative path for root: %w", err)
+		return fmt.Errorf(errComputeRelativeRootFailed, err)
 	}
 	assetsRel, err := filepath.Rel(r.repoDir, r.cfg.AssetsDir)
 	if err != nil {
-		errMsg := fmt.Errorf("failed to compute relative path for assets: %w", err).Error()
+		errMsg := fmt.Errorf(errComputeRelativeAssetsFailed, err).Error()
 		r.status.SetError(errMsg)
-		return fmt.Errorf("failed to compute relative path for assets: %w", err)
+		return fmt.Errorf(errComputeRelativeAssetsFailed, err)
 	}
 	slog.Debug("RunBackup: staging content directories", "rootRel", rootRel, "assetsRel", assetsRel)
 
@@ -292,10 +541,10 @@ func (r *Repository) RunBackup() error {
 
 	if _, err := os.Stat(r.cfg.RootDir); err == nil {
 		if _, err := wt.Add(filepath.ToSlash(rootRel)); err != nil {
-			errMsg := fmt.Errorf("failed to stage root dir: %w", err).Error()
+			errMsg := fmt.Errorf(errStageRootDirFailed, err).Error()
 			slog.Debug("RunBackup: failed to stage root dir", "error", errMsg)
 			r.status.SetError(errMsg)
-			return fmt.Errorf("failed to stage root dir: %w", err)
+			return fmt.Errorf(errStageRootDirFailed, err)
 		}
 		slog.Debug("RunBackup: staged root dir", "path", rootRel)
 	} else {
@@ -304,10 +553,10 @@ func (r *Repository) RunBackup() error {
 	}
 	if _, err := os.Stat(r.cfg.AssetsDir); err == nil {
 		if _, err := wt.Add(filepath.ToSlash(assetsRel)); err != nil {
-			errMsg := fmt.Errorf("failed to stage assets dir: %w", err).Error()
+			errMsg := fmt.Errorf(errStageAssetsDirFailed, err).Error()
 			slog.Debug("RunBackup: failed to stage assets dir", "error", errMsg)
 			r.status.SetError(errMsg)
-			return fmt.Errorf("failed to stage assets dir: %w", err)
+			return fmt.Errorf(errStageAssetsDirFailed, err)
 		}
 		slog.Debug("RunBackup: staged assets dir", "path", assetsRel)
 	} else {
@@ -338,6 +587,20 @@ func (r *Repository) RunBackup() error {
 
 	if !staged {
 		slog.Info("backup skipped - no staged changes in content directories")
+		// Push only if there are genuinely unpushed local commits (e.g. the initial
+		// commit from Init() that was never pushed yet). After a successful pull or
+		// push, lastPushedHash equals local HEAD so this is a no-op — prevents the
+		// spurious non-fast-forward push errors when the remote advances between cycles.
+		if r.cfg.RemoteURL != "" {
+			localHead, err := r.repo.Head()
+			if err == nil && localHead.Hash() != r.lastPushedHash {
+				slog.Debug("RunBackup: pushing unpushed local commit", "commit", localHead.Hash().String())
+				if err := r.push(false); err != nil {
+					r.status.SetError(err.Error())
+					return fmt.Errorf("push failed: %w", err)
+				}
+			}
+		}
 		r.status.SetSuccess(time.Now())
 		return nil
 	}
@@ -366,66 +629,213 @@ func (r *Repository) RunBackup() error {
 			r.status.SetSuccess(time.Now())
 			return nil
 		}
-		errMsg := fmt.Errorf("failed to commit: %w", err).Error()
+		errMsg := fmt.Errorf(errCommitFailed, err).Error()
 		slog.Debug("RunBackup: commit failed", "error", errMsg)
 		r.status.SetError(errMsg)
-		return fmt.Errorf("failed to commit: %w", err)
+		return fmt.Errorf(errCommitFailed, err)
 	}
 	slog.Debug("RunBackup: commit created", "hash", commit.String(), "message", commitMsg)
 
+	// Each commit adds several loose objects; track them and GC when warranted.
+	// A typical commit touches ~3–5 objects (tree + blobs); use 10 as a
+	// conservative per-commit estimate so GC fires after ~50 commits.
+	r.looseObjsSinceGC += 10
+	r.maybeGC()
+
 	// Push to remote
 	if r.cfg.RemoteURL != "" {
-		slog.Debug("RunBackup: pushing to remote", "remote", r.cfg.RemoteURL, "branch", r.cfg.Branch, "commit", commit.String())
-		if err := r.push(commit.String()); err != nil {
+		slog.Debug("RunBackup: pushing to remote", "remote", r.remoteForLog(), "branch", r.cfg.Branch, "commit", commit.String())
+		if err := r.push(false); err != nil {
 			slog.Debug("RunBackup: push failed", "error", err)
 			r.status.SetError(err.Error())
 			return fmt.Errorf("push failed: %w", err)
 		}
-		slog.Info("backup committed and pushed to remote")
 	} else {
-		slog.Debug("RunBackup: no remote configured, skipping push")
-		slog.Info("backup committed locally (no remote configured)")
+		slog.Info("backup: committed locally (no remote configured)", "commit", commit.String())
 	}
 	r.status.SetSuccess(time.Now())
 	return nil
 }
 
-// push pushes the given commit hash to the configured remote.
-func (r *Repository) push(commitHash string) error {
-	slog.Debug("push: starting", "commit", commitHash, "remote", r.cfg.RemoteURL, "branch", r.cfg.Branch)
-
-	// Build SSH auth
-	slog.Debug("push: building SSH auth", "sshKeyPath", r.cfg.SSHKeyPath, "hasInlineKey", r.cfg.SSHKey != "")
-	auth, err := r.buildSSHAuth()
-	if err != nil {
-		slog.Debug("push: SSH auth build failed", "error", err)
-		return fmt.Errorf("failed to build SSH auth: %w", err)
+// maybeGC runs gc() once the estimated loose-object count exceeds the
+// threshold. The count is an approximation (10 objects per commit); a real
+// count would require iterating the object store on every cycle, which is
+// expensive. An occasional unnecessary GC is harmless.
+// The counter is only reset on success so that a persistent repack failure
+// retries after the next threshold is reached rather than silently never GC-ing.
+func (r *Repository) maybeGC() {
+	if r.looseObjsSinceGC < gcLooseThreshold {
+		return
 	}
-	slog.Debug("push: SSH auth built successfully")
+	if r.gc() {
+		r.looseObjsSinceGC = 0
+	}
+}
 
-	// Get remote - use r.repo directly since we're using the repo instance
-	remote, err := r.repo.Remote("origin")
-	if err != nil {
-		slog.Debug("push: remote 'origin' not found, creating it", "url", r.cfg.RemoteURL)
-		// Remote doesn't exist, create it
-		_, err = r.repo.CreateRemote(&config.RemoteConfig{
+// gc packs all loose objects into a single packfile and then deletes the loose
+// files. This is the go-git equivalent of `git gc --auto`.
+// Errors are logged but not propagated: a failed GC is not a backup failure.
+// Returns true on success so maybeGC can decide whether to reset the counter.
+func (r *Repository) gc() bool {
+	slog.Info("backup gc: starting — repacking loose objects")
+
+	los, ok := r.repo.Storer.(storer.LooseObjectStorer)
+	if !ok {
+		slog.Debug("backup gc: storer does not support loose object enumeration, skipping prune")
+		return true
+	}
+
+	// Enumerate loose objects BEFORE calling RepackObjects so the set we pack
+	// and the set we prune are exactly the same. Objects added during a
+	// concurrent operation (shouldn't happen on the single scheduler goroutine,
+	// but defensive) won't appear in toDelete and won't be touched.
+	var toDelete []plumbing.Hash
+	if err := los.ForEachObjectHash(func(h plumbing.Hash) error {
+		toDelete = append(toDelete, h)
+		return nil
+	}); err != nil {
+		slog.Warn("backup gc: failed to enumerate loose objects", "error", err)
+		return false
+	}
+
+	if len(toDelete) == 0 {
+		slog.Debug("backup gc: no loose objects to repack")
+		return true
+	}
+
+	if err := r.repo.RepackObjects(&gogit.RepackConfig{}); err != nil {
+		slog.Warn("backup gc: repack failed", "error", err)
+		return false
+	}
+
+	deleted := 0
+	for _, h := range toDelete {
+		if err := los.DeleteLooseObject(h); err != nil {
+			slog.Warn("backup gc: failed to delete loose object", "hash", h, "error", err)
+		} else {
+			deleted++
+		}
+	}
+	slog.Info("backup gc: completed", "packed_and_pruned", deleted)
+	return true
+}
+
+// pullBeforeBackup fetches from the remote and fast-forward merges any new
+// commits before we stage and commit wiki changes. This ensures our subsequent
+// push is always a fast-forward, even when the remote was modified externally.
+//
+// Error semantics:
+//   - nil / NoErrAlreadyUpToDate → proceed normally
+//   - ErrNonFastForwardUpdate    → local has unpushed commits AND remote diverged → NeedsIntervention
+//   - ErrUnstagedChanges         → same file changed on remote and in local wiki  → NeedsIntervention
+//   - ErrReferenceNotFound       → remote branch does not exist yet (first push)  → skip pull
+//   - other                      → transient error (network / auth)               → SetError, return
+func (r *Repository) pullBeforeBackup(wt *gogit.Worktree) error {
+	// Ensure "origin" remote exists before calling Pull.
+	if _, err := r.repo.Remote("origin"); err != nil {
+		if _, err2 := r.repo.CreateRemote(&config.RemoteConfig{
 			Name: "origin",
 			URLs: []string{r.cfg.RemoteURL},
-		})
-		if err != nil {
+		}); err2 != nil {
+			r.status.SetError(fmt.Sprintf("failed to create remote before pull: %v", err2))
+			return fmt.Errorf("failed to create remote before pull: %w", err2)
+		}
+		slog.Debug("pullBeforeBackup: created remote 'origin'", "url", r.remoteForLog())
+	}
+
+	auth, err := r.buildAuth()
+	if err != nil {
+		r.status.SetError(fmt.Sprintf("failed to build auth for pre-backup pull: %v", err))
+		return fmt.Errorf("failed to build auth for pre-backup pull: %w", err)
+	}
+
+	pullCtx, pullCancel := context.WithTimeout(context.Background(), networkTimeout)
+	defer pullCancel()
+
+	slog.Debug("pullBeforeBackup: pulling from remote", "remote", r.remoteForLog(), "branch", r.cfg.Branch)
+	pullErr := wt.PullContext(pullCtx, &gogit.PullOptions{
+		RemoteName:    "origin",
+		ReferenceName: plumbing.NewBranchReferenceName(r.cfg.Branch),
+		Auth:          auth,
+	})
+
+	switch {
+	case pullErr == nil:
+		if head, err := r.repo.Head(); err == nil {
+			slog.Info("pullBeforeBackup: pulled remote changes", "head", head.Hash().String())
+			// Remote is now at this HEAD — no push needed until we make new local commits.
+			r.lastPushedHash = head.Hash()
+		} else {
+			slog.Info("pullBeforeBackup: pulled remote changes")
+		}
+		return nil
+
+	case errors.Is(pullErr, gogit.NoErrAlreadyUpToDate):
+		slog.Debug("pullBeforeBackup: already up-to-date, no pull needed")
+		return nil
+
+	case errors.Is(pullErr, plumbing.ErrReferenceNotFound),
+		errors.Is(pullErr, transport.ErrEmptyRemoteRepository):
+		// Remote branch (or entire repo) does not exist yet — this is the first push. Skip pull.
+		slog.Debug("pullBeforeBackup: remote has no commits yet, skipping pull (first push)", "branch", r.cfg.Branch)
+		return nil
+
+	case errors.Is(pullErr, gogit.ErrNonFastForwardUpdate):
+		// The remote has commits that cannot be fast-forwarded onto local history.
+		// The local backup repo is authoritative (it holds all wiki commits), so the
+		// correct recovery is to overwrite the remote manually:
+		//   git -C <repoDir> push --force origin HEAD:<branch>
+		msg := "remote has diverged from local backup history; " +
+			"to recover, run: git -C " + r.repoDir + " push --force origin HEAD:" + r.cfg.Branch
+		slog.Error("pullBeforeBackup: "+msg, "remote", r.remoteForLog())
+		r.status.SetNeedsIntervention(msg)
+		return fmt.Errorf("%s", msg)
+
+	case errors.Is(pullErr, gogit.ErrUnstagedChanges):
+		// A file was modified both on the remote and in the local wiki (disk has
+		// a dirty version that pull cannot safely overwrite). The next backup cycle
+		// will retry; if the remote change should be discarded, reset that file on
+		// the remote repo and trigger a new backup.
+		msg := "pull conflict: a wiki file has been modified both on the remote and locally; " +
+			"reset the conflicting file on the remote or wait for the next backup cycle to retry"
+		slog.Error("pullBeforeBackup: "+msg, "remote", r.remoteForLog())
+		r.status.SetNeedsIntervention(msg)
+		return fmt.Errorf("%s", msg)
+
+	default:
+		errMsg := fmt.Sprintf("failed to pull from remote before backup: %v", pullErr)
+		slog.Error(errMsg, "remote", r.remoteForLog())
+		r.status.SetError(errMsg)
+		return fmt.Errorf("failed to pull from remote: %w", pullErr)
+	}
+}
+
+// push pushes the current local HEAD to the configured remote.
+// If force is true, a non-fast-forward push is allowed (overwrites remote history).
+func (r *Repository) push(force bool) error {
+	slog.Debug("push: starting", "force", force, "remote", r.remoteForLog(), "branch", r.cfg.Branch)
+
+	auth, err := r.buildAuth()
+	if err != nil {
+		return fmt.Errorf("failed to build auth: %w", err)
+	}
+
+	remote, err := r.repo.Remote("origin")
+	if err != nil {
+		slog.Debug("push: remote 'origin' not found, creating it", "url", r.remoteForLog())
+		if _, err = r.repo.CreateRemote(&config.RemoteConfig{
+			Name: "origin",
+			URLs: []string{r.cfg.RemoteURL},
+		}); err != nil {
 			return fmt.Errorf("failed to create remote: %w", err)
 		}
 		remote, err = r.repo.Remote("origin")
 		if err != nil {
 			return fmt.Errorf("failed to get remote: %w", err)
 		}
-		slog.Debug("push: remote 'origin' created", "url", r.cfg.RemoteURL)
-	} else {
-		remoteURLs := remote.Config().URLs
-		slog.Debug("push: remote 'origin' found", "urls", remoteURLs)
+		slog.Debug("push: remote 'origin' created", "url", r.remoteForLog())
 	}
 
-	// Resolve local HEAD to verify what we are about to push.
 	localHead, err := r.repo.Head()
 	if err != nil {
 		return fmt.Errorf("failed to resolve local HEAD: %w", err)
@@ -439,85 +849,88 @@ func (r *Repository) push(commitHash string) error {
 	// no longer has — causing go-git to short-circuit with ErrAlreadyUpToDate before
 	// even attempting to send the pack. Removing it forces a clean push.
 	trackingRef := plumbing.NewRemoteReferenceName("origin", r.cfg.Branch)
-	if rmErr := r.repo.Storer.RemoveReference(trackingRef); rmErr != nil && rmErr != plumbing.ErrReferenceNotFound {
-		slog.Debug("push: could not remove stale remote tracking ref", "ref", trackingRef.String(), "error", rmErr)
-	} else {
-		slog.Debug("push: cleared remote tracking ref", "ref", trackingRef.String())
+	if rmErr := r.repo.Storer.RemoveReference(trackingRef); rmErr != nil && !errors.Is(rmErr, plumbing.ErrReferenceNotFound) {
+		slog.Warn("push: could not remove stale remote tracking ref", "ref", trackingRef.String(), "error", rmErr)
 	}
 
 	// Use the resolved branch ref explicitly rather than HEAD.
 	// Symbolic HEAD in a force refspec can confuse go-git when the local branch
 	// name differs from the configured remote branch (e.g. local=master, remote=main).
-	localBranchRef := localHead.Name().String() // e.g. refs/heads/master
-	refSpec := config.RefSpec(localBranchRef + ":refs/heads/" + r.cfg.Branch)
-	slog.Debug("push: pushing", "refSpec", string(refSpec), "localBranch", localBranchRef, "remoteBranch", r.cfg.Branch)
-	err = remote.Push(&gogit.PushOptions{
+	localBranchRef := localHead.Name().String()
+	prefix := ""
+	if force {
+		prefix = "+"
+	}
+	refSpec := config.RefSpec(prefix + localBranchRef + ":refs/heads/" + r.cfg.Branch)
+	slog.Debug("push: pushing", "refSpec", string(refSpec), "commit", localHead.Hash().String())
+
+	pushCtx, pushCancel := context.WithTimeout(context.Background(), networkTimeout)
+	defer pushCancel()
+	err = remote.PushContext(pushCtx, &gogit.PushOptions{
 		Auth:     auth,
 		RefSpecs: []config.RefSpec{refSpec},
+		Force:    force,
 	})
 	if err != nil {
-		if strings.Contains(strings.ToLower(err.Error()), "already up-to-date") {
-			// Genuine up-to-date: remote caught up between our List call and Push.
-			slog.Info("backup skipped - already up-to-date on " + r.cfg.Branch + " at remote URL: " + r.cfg.RemoteURL)
+		if errors.Is(err, gogit.NoErrAlreadyUpToDate) {
+			slog.Debug("push: remote already up-to-date")
+			r.lastPushedHash = localHead.Hash()
 			return nil
 		}
-		slog.Error("git push failed", "error", err, "remote", r.cfg.RemoteURL, "branch", r.cfg.Branch, "refSpec", string(refSpec))
+		slog.Error("git push failed", "error", err, "remote", r.remoteForLog(), "branch", r.cfg.Branch, "refSpec", string(refSpec))
 		return fmt.Errorf("failed to push: %w", err)
 	}
-	slog.Info("git push succeeded", "remote", r.cfg.RemoteURL, "branch", r.cfg.Branch, "commit", commitHash)
+	r.lastPushedHash = localHead.Hash()
+	slog.Info("backup: pushed to remote", "remote", r.remoteForLog(), "branch", r.cfg.Branch, "commit", localHead.Hash().String(), "force", force)
 	return nil
 }
 
-// buildSSHAuth builds SSH authentication from config.
-func (r *Repository) buildSSHAuth() (ssh.AuthMethod, error) {
-	var privateKey []byte
-	var err error
+// redactRemote masks credentials embedded in a remote URL
+// (https://user:token@host/repo.git) so the token never reaches a log line or a
+// status message shown in the UI. Non-URL remotes (git@host:path) are returned
+// unchanged — they carry no secret.
+func redactRemote(remoteURL string) string {
+	u, err := url.Parse(remoteURL)
+	if err != nil || u.User == nil {
+		return remoteURL
+	}
+	return u.Redacted()
+}
 
-	// Try SSHKey string first
-	if r.cfg.SSHKey != "" {
-		slog.Debug("buildSSHAuth: using inline SSH key")
-		privateKey = []byte(r.cfg.SSHKey)
-	} else if r.cfg.SSHKeyPath != "" {
-		slog.Debug("buildSSHAuth: reading SSH key from file", "path", r.cfg.SSHKeyPath)
-		privateKey, err = os.ReadFile(r.cfg.SSHKeyPath)
-		if err != nil {
-			slog.Debug("buildSSHAuth: failed to read SSH key file", "path", r.cfg.SSHKeyPath, "error", err)
-			return nil, fmt.Errorf("failed to read SSH key: %w", err)
-		}
-		slog.Debug("buildSSHAuth: SSH key file read successfully", "path", r.cfg.SSHKeyPath, "size", len(privateKey))
-	} else {
-		slog.Debug("buildSSHAuth: no SSH key configured (neither inline nor path)")
-		return nil, fmt.Errorf("no SSH key provided")
+// remoteForLog returns the configured remote with any embedded credentials
+// masked. Use it everywhere the remote is logged or surfaced to the user.
+func (r *Repository) remoteForLog() string {
+	return redactRemote(r.cfg.RemoteURL)
+}
+
+// buildAuth builds the transport authentication for the configured remote.
+// The implementation lives in auth.go as package functions so TestRemote can
+// reuse it; this method just binds it to the repository's own config.
+func (r *Repository) buildAuth() (transport.AuthMethod, error) {
+	return buildAuth(r.cfg)
+}
+
+// ForcePush overwrites the remote branch with the current local HEAD.
+// Used to recover from NeedsIntervention state when the remote has diverged.
+// Returns an error immediately if the scheduler goroutine is mid-RunBackup
+// (rather than blocking the HTTP handler for up to 4 minutes).
+func (r *Repository) ForcePush() error {
+	if !r.mu.TryLock() {
+		return fmt.Errorf("backup is currently running — try again in a moment")
+	}
+	defer r.mu.Unlock()
+
+	if r.cfg.RemoteURL == "" {
+		return fmt.Errorf("no remote configured")
 	}
 
-	// Parse the private key using x/crypto/ssh
-	signer, err := sshcrypto.ParsePrivateKey(privateKey)
-	if err != nil {
-		slog.Error("failed to parse SSH key", "error", err, "path", r.cfg.SSHKeyPath)
-		return nil, fmt.Errorf("failed to parse SSH key: %w", err)
+	if err := r.push(true); err != nil {
+		r.status.SetError(fmt.Sprintf("force push failed: %v", err))
+		return fmt.Errorf("force push failed: %w", err)
 	}
-	slog.Debug("buildSSHAuth: SSH key parsed successfully", "keyType", signer.PublicKey().Type())
-
-	auth := &ssh.PublicKeys{
-		User:   "git",
-		Signer: signer,
-	}
-
-	// Use known hosts file for MITM protection if a path was provided.
-	// If a path is configured but unreadable, we return an error rather than
-	// silently downgrading to no host-key verification.
-	if r.cfg.SSHKnownHostsPath != "" {
-		knownHostsCallback, err := ssh.NewKnownHostsCallback(r.cfg.SSHKnownHostsPath)
-		if err != nil {
-			return nil, fmt.Errorf("failed to load known_hosts file %q: %w", r.cfg.SSHKnownHostsPath, err)
-		}
-		auth.HostKeyCallback = knownHostsCallback
-		slog.Debug("buildSSHAuth: SSH auth configured with known hosts", "path", r.cfg.SSHKnownHostsPath)
-	} else {
-		slog.Warn("buildSSHAuth: no SSHKnownHostsPath provided, connection will be insecure (no MITM protection)")
-		auth.HostKeyCallback = sshcrypto.InsecureIgnoreHostKey()
-	}
-	return auth, nil
+	r.status.SetSuccess(time.Now())
+	slog.Info("backup: force-pushed to remote", "remote", r.remoteForLog(), "branch", r.cfg.Branch)
+	return nil
 }
 
 // Status returns a snapshot of the last backup time and any error.

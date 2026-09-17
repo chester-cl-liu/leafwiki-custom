@@ -6,9 +6,11 @@ import (
 )
 
 type Status struct {
-	mu           sync.RWMutex
-	LastBackupAt time.Time
-	LastError    string
+	mu                sync.RWMutex
+	LastBackupAt      time.Time
+	LastError         string
+	NeedsIntervention bool
+	ConflictDetails   string
 }
 
 func (s *Status) SetSuccess(t time.Time) {
@@ -16,12 +18,35 @@ func (s *Status) SetSuccess(t time.Time) {
 	defer s.mu.Unlock()
 	s.LastBackupAt = t
 	s.LastError = ""
+	s.NeedsIntervention = false
+	s.ConflictDetails = ""
 }
 
 func (s *Status) SetError(err string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.LastError = err
+	s.NeedsIntervention = false
+	s.ConflictDetails = ""
+}
+
+func (s *Status) SetNeedsIntervention(details string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.NeedsIntervention = true
+	s.ConflictDetails = details
+	s.LastError = details
+}
+
+// ClearIntervention clears any stale error/conflict state, without touching
+// LastBackupAt (unlike SetSuccess — a pull is not a backup, so it must not be
+// reported as one).
+func (s *Status) ClearIntervention() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.LastError = ""
+	s.NeedsIntervention = false
+	s.ConflictDetails = ""
 }
 
 func (s *Status) Snapshot() StatusSnapshot {
@@ -33,12 +58,16 @@ func (s *Status) Snapshot() StatusSnapshot {
 		lastBackupAt = &t
 	}
 	return StatusSnapshot{
-		LastBackupAt: lastBackupAt,
-		LastError:    s.LastError,
+		LastBackupAt:      lastBackupAt,
+		LastError:         s.LastError,
+		NeedsIntervention: s.NeedsIntervention,
+		ConflictDetails:   s.ConflictDetails,
 	}
 }
 
 type StatusSnapshot struct {
-	LastBackupAt *time.Time `json:"lastBackupAt,omitempty"`
-	LastError    string     `json:"lastError,omitempty"`
+	LastBackupAt      *time.Time `json:"lastBackupAt,omitempty"`
+	LastError         string     `json:"lastError,omitempty"`
+	NeedsIntervention bool       `json:"needsIntervention,omitempty"`
+	ConflictDetails   string     `json:"conflictDetails,omitempty"`
 }

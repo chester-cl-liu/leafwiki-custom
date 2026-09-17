@@ -13,10 +13,15 @@ import (
 	httpinternal "github.com/perber/wiki/internal/http"
 	"github.com/perber/wiki/internal/http/dto"
 	authmw "github.com/perber/wiki/internal/http/middleware/auth"
-	"github.com/perber/wiki/internal/http/middleware/security"
 )
 
 // Routes is the RouteRegistrar for the revisions domain.
+const (
+	errPageIDRequiredUserMsg   = "Page ID is required"
+	errPageIDRequiredLogMsg    = "page id is required"
+	errRevisionNotFoundUserMsg = "Revision not found"
+)
+
 type Routes struct {
 	listRevisions    *ListRevisionsUseCase
 	getRevision      *GetRevisionUseCase
@@ -61,12 +66,7 @@ func NewRoutes(cfg RoutesConfig) *Routes {
 func (r *Routes) RegisterRoutes(ctx httpinternal.RouterContext) {
 	opts := ctx.Opts
 
-	authGroup := ctx.Base.Group("/api")
-	authGroup.Use(
-		authmw.InjectPublicEditor(opts.AuthDisabled),
-		authmw.RequireAuth(r.authService, ctx.AuthCookies, opts.AuthDisabled),
-		security.CSRFMiddleware(ctx.CSRFCookie),
-	)
+	authGroup := ctx.APIAuthGroup(r.authService)
 
 	// Revision routes are behind the EnableRevision feature flag.
 	if opts.EnableRevision {
@@ -85,7 +85,7 @@ func (r *Routes) RegisterRoutes(ctx httpinternal.RouterContext) {
 func (r *Routes) handleListRevisions(c *gin.Context) {
 	pageID := strings.TrimSpace(c.Param("id"))
 	if pageID == "" {
-		respondWithRevisionStatusError(c, http.StatusBadRequest, ErrCodeRevisionInvalidPageID, "Page ID is required", "page id is required")
+		respondWithRevisionStatusError(c, http.StatusBadRequest, ErrCodeRevisionInvalidPageID, errPageIDRequiredUserMsg, errPageIDRequiredLogMsg)
 		return
 	}
 
@@ -123,7 +123,7 @@ func (r *Routes) handleGetRevision(c *gin.Context) {
 	pageID := strings.TrimSpace(c.Param("id"))
 	revisionID := strings.TrimSpace(c.Param("revisionId"))
 	if pageID == "" {
-		respondWithRevisionStatusError(c, http.StatusBadRequest, ErrCodeRevisionInvalidPageID, "Page ID is required", "page id is required")
+		respondWithRevisionStatusError(c, http.StatusBadRequest, ErrCodeRevisionInvalidPageID, errPageIDRequiredUserMsg, errPageIDRequiredLogMsg)
 		return
 	}
 	if revisionID == "" {
@@ -137,7 +137,7 @@ func (r *Routes) handleGetRevision(c *gin.Context) {
 		return
 	}
 	if out.Snapshot == nil || out.Snapshot.Revision == nil {
-		respondWithRevisionStatusError(c, http.StatusNotFound, ErrCodeRevisionNotFound, "Revision not found", "revision %s for page %s not found", revisionID, pageID)
+		respondWithRevisionStatusError(c, http.StatusNotFound, ErrCodeRevisionNotFound, errRevisionNotFoundUserMsg, "revision %s for page %s not found", revisionID, pageID)
 		return
 	}
 	c.JSON(http.StatusOK, toSnapshotResponse(out.Snapshot, r.userResolver))
@@ -146,7 +146,7 @@ func (r *Routes) handleGetRevision(c *gin.Context) {
 func (r *Routes) handleGetLatestRevision(c *gin.Context) {
 	pageID := strings.TrimSpace(c.Param("id"))
 	if pageID == "" {
-		respondWithRevisionStatusError(c, http.StatusBadRequest, ErrCodeRevisionInvalidPageID, "Page ID is required", "page id is required")
+		respondWithRevisionStatusError(c, http.StatusBadRequest, ErrCodeRevisionInvalidPageID, errPageIDRequiredUserMsg, errPageIDRequiredLogMsg)
 		return
 	}
 
@@ -156,7 +156,7 @@ func (r *Routes) handleGetLatestRevision(c *gin.Context) {
 		return
 	}
 	if out.Revision == nil {
-		respondWithRevisionStatusError(c, http.StatusNotFound, ErrCodeRevisionNotFound, "Revision not found", "revision for page %s not found", pageID)
+		respondWithRevisionStatusError(c, http.StatusNotFound, ErrCodeRevisionNotFound, errRevisionNotFoundUserMsg, "revision for page %s not found", pageID)
 		return
 	}
 	c.JSON(http.StatusOK, toRevisionResponse(out.Revision, r.userResolver))
@@ -167,7 +167,7 @@ func (r *Routes) handleCompareRevisions(c *gin.Context) {
 	baseRevisionID := strings.TrimSpace(c.Query("base"))
 	targetRevisionID := strings.TrimSpace(c.Query("target"))
 	if pageID == "" {
-		respondWithRevisionStatusError(c, http.StatusBadRequest, ErrCodeRevisionInvalidPageID, "Page ID is required", "page id is required")
+		respondWithRevisionStatusError(c, http.StatusBadRequest, ErrCodeRevisionInvalidPageID, errPageIDRequiredUserMsg, errPageIDRequiredLogMsg)
 		return
 	}
 	if baseRevisionID == "" || targetRevisionID == "" {
@@ -183,7 +183,7 @@ func (r *Routes) handleCompareRevisions(c *gin.Context) {
 		return
 	}
 	if out.Comparison == nil || out.Comparison.Base == nil || out.Comparison.Target == nil {
-		respondWithRevisionStatusError(c, http.StatusNotFound, ErrCodeRevisionNotFound, "Revision not found", "revision compare resource for page %s not found", pageID)
+		respondWithRevisionStatusError(c, http.StatusNotFound, ErrCodeRevisionNotFound, errRevisionNotFoundUserMsg, "revision compare resource for page %s not found", pageID)
 		return
 	}
 	c.JSON(http.StatusOK, toComparisonResponse(out.Comparison, r.userResolver))
@@ -194,7 +194,7 @@ func (r *Routes) handleGetRevisionAsset(c *gin.Context) {
 	revisionID := strings.TrimSpace(c.Param("revisionId"))
 	assetName := strings.TrimSpace(strings.TrimPrefix(c.Param("name"), "/"))
 	if pageID == "" {
-		respondWithRevisionStatusError(c, http.StatusBadRequest, ErrCodeRevisionInvalidPageID, "Page ID is required", "page id is required")
+		respondWithRevisionStatusError(c, http.StatusBadRequest, ErrCodeRevisionInvalidPageID, errPageIDRequiredUserMsg, errPageIDRequiredLogMsg)
 		return
 	}
 	if revisionID == "" {
@@ -273,4 +273,3 @@ func (r *Routes) handleRestoreRevision(c *gin.Context) {
 	}
 	c.JSON(http.StatusOK, dto.ToAPIPage(out.Page, r.userResolver))
 }
-

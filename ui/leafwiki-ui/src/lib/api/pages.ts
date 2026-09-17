@@ -27,6 +27,7 @@ export type PageNode = {
   parentId?: string | null
   children: PageNode[] | null
   kind: 'page' | 'section'
+  pinned?: boolean
   metadata?: PageMetadata // optional metadata, because older API responses may not have it
 }
 
@@ -90,9 +91,13 @@ export async function suggestSlug(
   return typedData.slug
 }
 
-export async function getPageByPath(path: string): Promise<Page> {
+export async function getPageByPath(
+  path: string,
+  signal?: AbortSignal,
+): Promise<Page> {
   return (await fetchWithAuth(
     `/api/pages/by-path?path=${encodeURIComponent(path)}`,
+    { signal },
   )) as Page
 }
 
@@ -177,13 +182,18 @@ export async function movePage(
   id: string,
   version: string,
   parentId: string | null,
+  position?: number,
 ) {
   if (parentId === '' || parentId == 'root') parentId = null
 
   return await fetchWithAuth(`/api/pages/${id}/move`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ version, parentId }),
+    body: JSON.stringify(
+      position === undefined
+        ? { version, parentId }
+        : { version, parentId, position },
+    ),
   })
 }
 
@@ -223,6 +233,7 @@ export async function applyPageRefactor(
         version: string
         parentId: string | null
         rewriteLinks: boolean
+        position?: number
       },
 ): Promise<Page | null> {
   return (await fetchWithAuth(`/api/pages/${id}/refactor/apply`, {
@@ -230,6 +241,18 @@ export async function applyPageRefactor(
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
   })) as Page | null
+}
+
+export async function pinPage(
+  id: string,
+  version: string,
+  pinned: boolean,
+): Promise<Page> {
+  return (await fetchWithAuth(`/api/pages/${id}/pin`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ version, pinned }),
+  })) as Page
 }
 
 export async function sortPages(parentId: string, orderedIDs: string[]) {

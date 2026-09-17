@@ -4,16 +4,20 @@ import { Checkbox } from '@/components/ui/checkbox'
 import { PageRefactorPreview } from '@/lib/api/pages'
 import { DIALOG_PAGE_REFACTOR_CONFIRMATION } from '@/lib/registries'
 import { useRef, useState } from 'react'
+import { useTranslation } from 'react-i18next'
 
 export type PageRefactorDialogProps = {
   preview: PageRefactorPreview
+  allowSkipRewrite?: boolean
   onResolve: (rewriteLinks: boolean | null) => void
 }
 
 export function PageRefactorDialog({
   preview,
+  allowSkipRewrite = false,
   onResolve,
 }: PageRefactorDialogProps) {
+  const { t } = useTranslation('page')
   const previewWarnings = preview.warnings ?? []
   const defaultRewriteLinks = preview.counts.matchedLinks > 0
   const [rewriteLinks, setRewriteLinks] = useState(defaultRewriteLinks)
@@ -30,8 +34,8 @@ export function PageRefactorDialog({
   return (
     <BaseDialog
       dialogType={DIALOG_PAGE_REFACTOR_CONFIRMATION}
-      dialogTitle="Update references?"
-      dialogDescription="This change affects the page path. Review the impacted pages before continuing."
+      dialogTitle={t('refactorDialog.title')}
+      dialogDescription={t('refactorDialog.description')}
       onClose={() => {
         resolveOnce(null)
         return true
@@ -41,18 +45,31 @@ export function PageRefactorDialog({
           resolveOnce(rewriteLinks)
           return true
         }
+        if (type === 'save-without-rewrite') {
+          resolveOnce(false)
+          return true
+        }
         return false
       }}
       defaultAction="cancel"
       testidPrefix="page-refactor-dialog"
       cancelButton={{
-        label: 'Cancel',
+        label: t('common.cancel'),
         variant: 'outline',
         autoFocus: false,
       }}
       buttons={[
+        ...(allowSkipRewrite
+          ? [
+              {
+                label: t('refactorDialog.saveWithoutRewrite'),
+                actionType: 'save-without-rewrite',
+                variant: 'secondary' as const,
+              },
+            ]
+          : []),
         {
-          label: 'Continue',
+          label: t('refactorDialog.continue'),
           actionType: 'confirm',
           variant: 'default',
           autoFocus: true,
@@ -62,11 +79,11 @@ export function PageRefactorDialog({
       <div className="space-y-4">
         <div className="space-y-1 text-sm">
           <div>
-            <span className="font-medium">Old path:</span>{' '}
+            <span className="font-medium">{t('refactorDialog.oldPath')}</span>{' '}
             <span className="font-mono">{preview.oldPath}</span>
           </div>
           <div>
-            <span className="font-medium">New path:</span>{' '}
+            <span className="font-medium">{t('refactorDialog.newPath')}</span>{' '}
             <span className="font-mono">{preview.newPath}</span>
           </div>
         </div>
@@ -78,7 +95,7 @@ export function PageRefactorDialog({
             onCheckedChange={(value) => setRewriteLinks(!!value)}
             disabled={!defaultRewriteLinks}
           />
-          Update links on referencing pages automatically
+          {t('refactorDialog.updateLinksLabel')}
         </label>
 
         <div className="space-y-2">
@@ -86,7 +103,9 @@ export function PageRefactorDialog({
             className="text-sm font-medium"
             data-testid="page-refactor-dialog-referencing-pages-heading"
           >
-            Referencing pages ({preview.counts.affectedPages})
+            {t('refactorDialog.referencingPages', {
+              count: preview.counts.affectedPages,
+            })}
           </div>
 
           {previewWarnings.length > 0 && (
@@ -109,7 +128,7 @@ export function PageRefactorDialog({
             {preview.affectedPages.length === 0 ? (
               <div data-testid="page-refactor-dialog-no-references">
                 <ListViewStatus className="page-refactor-dialog__result-summary">
-                  No pages reference this path.
+                  {t('refactorDialog.noReferences')}
                 </ListViewStatus>
               </div>
             ) : (

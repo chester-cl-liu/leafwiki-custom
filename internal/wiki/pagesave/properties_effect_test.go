@@ -24,7 +24,7 @@ func setupPropertiesEffectTest(t *testing.T) (*tree.TreeService, *properties.Pro
 	t.Cleanup(func() { test_utils.WrapCloseWithErrorCheck(store.Close, t) })
 
 	svc := properties.NewPropertiesService(store)
-	effect := NewPropertiesSideEffect(svc, nil)
+	effect := NewPropertiesSideEffect(svc, nil, nil)
 	return treeSvc, svc, effect
 }
 
@@ -66,7 +66,7 @@ func TestPropertiesSideEffect_Apply_Update_ReindexesProperties(t *testing.T) {
 	effect.Apply(PageSaveEvent{Operation: PageOperationCreate, After: page})
 
 	newRaw := "---\nstatus: published\n---\n\nUpdated."
-	if err := treeSvc.UpdateNode("system", page.ID, "Update Props", "update-props", &newRaw, tree.VersionUnchecked, true); err != nil {
+	if err := treeSvc.UpdateNode("system", page.ID, "Update Props", "update-props", &newRaw, tree.VersionUnchecked, nil, nil, true); err != nil {
 		t.Fatalf("UpdateNode: %v", err)
 	}
 	updated, err := treeSvc.GetPage(page.ID)

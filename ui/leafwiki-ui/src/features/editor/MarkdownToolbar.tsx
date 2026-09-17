@@ -14,13 +14,18 @@ import { useIsMobile } from '@/lib/useIsMobile'
 import { useDialogsStore } from '@/stores/dialogs'
 import {
   Bold,
+  ClipboardPaste,
+  ClipboardType,
   Code,
   Code2,
+  Columns2,
   Eye,
+  Highlighter,
   Image,
   Italic,
   Link,
   MoreHorizontal,
+  Rows2,
   Redo,
   Strikethrough,
   Table,
@@ -30,6 +35,7 @@ import {
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { useEditorStore } from '@/stores/editor'
+import { useUserSettingsStore } from '@/stores/userSettings'
 import { MarkdownEditorRef } from './MarkdownEditor'
 
 type Props = {
@@ -37,7 +43,9 @@ type Props = {
   onAssetVersionChange?: (version: number) => void
   pageId: string
   previewVisible: boolean
+  previewStacked: boolean
   onTogglePreview: () => void
+  onTogglePreviewLayout: () => void
 }
 
 export default function MarkdownToolbar({
@@ -45,14 +53,16 @@ export default function MarkdownToolbar({
   onAssetVersionChange,
   pageId,
   previewVisible,
+  previewStacked,
   onTogglePreview,
+  onTogglePreviewLayout,
 }: Props) {
   const { t } = useTranslation('editor')
   const openDialog = useDialogsStore((state) => state.openDialog)
   const lineWrap = useEditorStore((s) => s.lineWrap)
   const toggleLineWrap = useEditorStore((s) => s.toggleLineWrap)
-  const autoSave = useEditorStore((s) => s.autoSave)
-  const toggleAutoSave = useEditorStore((s) => s.toggleAutoSave)
+  const autoSave = useUserSettingsStore((s) => s.autoSave)
+  const toggleAutoSave = useUserSettingsStore((s) => s.toggleAutoSave)
   const autoSaveStatus = useEditorStore((s) => s.autoSaveStatus)
   const [canUndo, setCanUndo] = useState(false)
   const [canRedo, setCanRedo] = useState(false)
@@ -138,6 +148,23 @@ export default function MarkdownToolbar({
               className="markdown-toolbar__button"
             >
               <Strikethrough className="markdown-toolbar__icon" />
+            </Button>
+          </TooltipWrapper>
+        )}
+        {!isMobile && (
+          <TooltipWrapper
+            label={t('toolbar.highlightTooltip')}
+            side="top"
+            align="center"
+          >
+            <Button
+              variant="ghost"
+              size="icon"
+              onClick={() => editorRef.current?.insertWrappedText('==')}
+              className="markdown-toolbar__button"
+              data-testid="format-highlight-button"
+            >
+              <Highlighter className="markdown-toolbar__icon" />
             </Button>
           </TooltipWrapper>
         )}
@@ -336,6 +363,41 @@ export default function MarkdownToolbar({
             <Image className="markdown-toolbar__icon" />
           </Button>
         </TooltipWrapper>
+        {!isMobile && (
+          <>
+            <div className="markdown-toolbar__separator" />
+            <TooltipWrapper
+              label={t('toolbar.pasteRichTooltip')}
+              side="top"
+              align="center"
+            >
+              <Button
+                variant="ghost"
+                size="icon"
+                className="markdown-toolbar__button"
+                data-testid="paste-rich-button"
+                onClick={() => editorRef.current?.pasteRich()}
+              >
+                <ClipboardType className="markdown-toolbar__icon" />
+              </Button>
+            </TooltipWrapper>
+            <TooltipWrapper
+              label={t('toolbar.pastePlainTooltip')}
+              side="top"
+              align="center"
+            >
+              <Button
+                variant="ghost"
+                size="icon"
+                className="markdown-toolbar__button"
+                data-testid="paste-plain-button"
+                onClick={() => editorRef.current?.pastePlain()}
+              >
+                <ClipboardPaste className="markdown-toolbar__icon" />
+              </Button>
+            </TooltipWrapper>
+          </>
+        )}
         <div className="markdown-toolbar__separator max-sm:hidden" />
         <TooltipWrapper
           label={t('toolbar.undoTooltip')}
@@ -412,6 +474,12 @@ export default function MarkdownToolbar({
                 <Strikethrough size={14} />
                 {t('toolbar.strikethrough')}
               </DropdownMenuItem>
+              <DropdownMenuItem
+                onSelect={() => editorRef.current?.insertWrappedText('==')}
+              >
+                <Highlighter size={14} />
+                {t('toolbar.highlight')}
+              </DropdownMenuItem>
               <DropdownMenuSeparator />
               <DropdownMenuItem
                 onSelect={() => editorRef.current?.insertHeading(1)}
@@ -439,6 +507,17 @@ export default function MarkdownToolbar({
               >
                 <Table size={14} />
                 {t('toolbar.insertTable')}
+              </DropdownMenuItem>
+              <DropdownMenuSeparator />
+              <DropdownMenuItem onSelect={() => editorRef.current?.pasteRich()}>
+                <ClipboardType size={14} />
+                {t('toolbar.pasteRich')}
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                onSelect={() => editorRef.current?.pastePlain()}
+              >
+                <ClipboardPaste size={14} />
+                {t('toolbar.pastePlain')}
               </DropdownMenuItem>
               <DropdownMenuSeparator />
               <DropdownMenuCheckboxItem
@@ -469,6 +548,33 @@ export default function MarkdownToolbar({
         {!isMobile && (
           <>
             <div className="markdown-toolbar__separator" />
+            <TooltipWrapper
+              label={t(
+                previewStacked
+                  ? 'toolbar.previewSplitTooltip'
+                  : 'toolbar.previewStackedTooltip',
+              )}
+              side="top"
+              align="center"
+            >
+              <Button
+                variant="ghost"
+                size="icon"
+                onClick={onTogglePreviewLayout}
+                className={cn(
+                  'markdown-toolbar__button markdown-toolbar__button--desktop-only',
+                  {
+                    'markdown-toolbar__button--active': previewStacked,
+                  },
+                )}
+              >
+                {previewStacked ? (
+                  <Columns2 className="markdown-toolbar__icon" />
+                ) : (
+                  <Rows2 className="markdown-toolbar__icon" />
+                )}
+              </Button>
+            </TooltipWrapper>
             <TooltipWrapper
               label={t(
                 previewVisible

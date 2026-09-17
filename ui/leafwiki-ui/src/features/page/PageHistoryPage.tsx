@@ -1,21 +1,16 @@
 import Page404 from '@/components/Page404'
 import { buildViewUrl } from '@/lib/routePath'
 import {
-  createHotkeyDefinition,
-  getShortcutDisplayLabel,
-} from '@/lib/shortcuts/shortcutCatalog'
-import {
   createNavigationVisitState,
   getNavigationVisitKey,
 } from '@/lib/navigationVisit'
 import { useScrollRestoration } from '@/lib/useScrollRestoration'
-import { type HotKeyDefinition, useHotKeysStore } from '@/stores/hotkeys'
 import { useTreeStore } from '@/stores/tree'
 import { useCallback, useEffect } from 'react'
-import { ArrowLeft } from 'lucide-react'
-import { useToolbarStore } from '../toolbar/toolbarStore'
+import { useTranslation } from 'react-i18next'
+import { useExitModeButton } from '../toolbar/useExitModeButton'
 import { getWikiTargetRoutePath, toWikiLookupPath } from '@/lib/wikiPath'
-import { useLocation, useNavigate } from 'react-router-dom'
+import { useLocation, useNavigate } from 'react-router'
 import { useProgressbarStore } from '../progressbar/progressbarStore'
 import { useSetPageTitle } from '../viewer/useSetPageTitle'
 import { useViewerStore } from '../viewer/viewer'
@@ -23,21 +18,16 @@ import { PageHistoryContent } from '@/features/history/PageHistoryContent'
 import { usePageHistory } from '@/features/history/pageHistory'
 
 export default function PageHistoryPage() {
+  const { t } = useTranslation('page')
   const location = useLocation()
   const { pathname } = location
   const navigate = useNavigate()
   const openNode = useTreeStore((state) => state.openNode)
-  const setToolbarButtons = useToolbarStore((state) => state.setButtons)
-  const registerHotkey = useHotKeysStore((state) => state.registerHotkey)
-  const unregisterHotkey = useHotKeysStore((state) => state.unregisterHotkey)
   const loading = useProgressbarStore((s) => s.loading)
   const error = useViewerStore((s) => s.error)
   const notFound = useViewerStore((s) => s.notFound)
   const page = useViewerStore((s) => s.page)
   const loadPageData = useViewerStore((s) => s.loadPageData)
-  const isMacOS =
-    typeof navigator !== 'undefined' &&
-    /Mac|iPhone|iPad|iPod/.test(navigator.platform)
 
   usePageHistory(page?.id ?? null)
 
@@ -60,43 +50,24 @@ export default function PageHistoryPage() {
     openNode(page.id)
   }, [openNode, page?.id])
 
-  useEffect(() => {
-    setToolbarButtons([
-      {
-        id: 'close-history',
-        label: 'Back to Page',
-        hotkey: getShortcutDisplayLabel('history.page.close', isMacOS),
-        icon: <ArrowLeft size={18} />,
-        action: closeHistory,
-        variant: 'outline',
-      },
-    ])
-
-    const closeHotkey: HotKeyDefinition = createHotkeyDefinition(
-      'history.page.close',
-      closeHistory,
-    )
-
-    registerHotkey(closeHotkey)
-
-    return () => {
-      setToolbarButtons([])
-      unregisterHotkey(closeHotkey.keyCombo)
-    }
-  }, [
-    closeHistory,
-    isMacOS,
-    registerHotkey,
-    setToolbarButtons,
-    unregisterHotkey,
-  ])
+  useExitModeButton({
+    id: 'close-history',
+    labelKey: 'historyPage.backToPage',
+    ns: 'page',
+    hotkeyId: 'history.page.close',
+    onExit: closeHistory,
+  })
 
   const renderError = () => {
     if (!loading && notFound) {
       return <Page404 targetPath={getWikiTargetRoutePath(pathname)} />
     }
     if (!loading && error) {
-      return <p className="page-viewer__error">Error: {error}</p>
+      return (
+        <p className="page-viewer__error">
+          {t('common.errorPrefix', { error })}
+        </p>
+      )
     }
     return null
   }

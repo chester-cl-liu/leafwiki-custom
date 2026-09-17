@@ -1,6 +1,7 @@
 package tree
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -11,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/perber/wiki/internal/core/ignore"
 	"github.com/perber/wiki/internal/core/shared"
 	"github.com/perber/wiki/internal/core/treemigration"
 )
@@ -29,19 +31,31 @@ type TreeService struct {
 	mu sync.RWMutex
 }
 
-// NewTreeService creates a new TreeService
-const legacyTreeFilename = "tree.json"
+const (
+	legacyTreeFilename         = "tree.json"
+	errNilTreeReconstructed    = "internal error: tree reconstruction returned nil tree"
+	errPersistChildOrderFailed = "could not persist child order: %w"
+	errGetPageContentFailed    = "could not get page content: %w"
+	errRollbackMovedNodeFailed = "rollback moved node: %w"
+)
 
 func NewTreeService(storageDir string) *TreeService {
+	store := NewNodeStore(storageDir)
+
 	return &TreeService{
 		storageDir:   storageDir,
 		tree:         nil,
-		store:        NewNodeStore(storageDir),
+		store:        store,
 		log:          slog.Default().With("component", "TreeService"),
 		nodesByID:    make(map[string]*PageNode),
 		nodesByTitle: make(map[string][]*PageNode),
 		childSlugs:   make(map[string]map[string]*PageNode),
 	}
+}
+
+// SetIgnoreCache sets the ignore cache for multi-level ignore resolution.
+func (t *TreeService) SetIgnoreCache(ignoreCache *ignore.Cache) {
+	t.store.SetIgnoreCache(ignoreCache)
 }
 
 // LoadTree reconstructs the in-memory tree from the filesystem.
@@ -63,7 +77,7 @@ func (t *TreeService) LoadTree() error {
 			return err
 		}
 		if reconstructed == nil {
-			return fmt.Errorf("internal error: tree reconstruction returned nil tree")
+			return errors.New(errNilTreeReconstructed)
 		}
 		t.tree = reconstructed
 		t.rebuildIndexesLocked()
@@ -90,7 +104,7 @@ func (t *TreeService) LoadTree() error {
 	}
 
 	if t.tree == nil {
-		return fmt.Errorf("internal error: tree reconstruction returned nil tree")
+		return errors.New(errNilTreeReconstructed)
 	}
 
 	t.log.Info("Migrating schema", "fromVersion", schema.Version, "toVersion", CurrentSchemaVersion)
@@ -104,7 +118,7 @@ func (t *TreeService) LoadTree() error {
 		return err
 	}
 	if reconstructed == nil {
-		return fmt.Errorf("internal error: tree reconstruction returned nil tree")
+		return errors.New(errNilTreeReconstructed)
 	}
 
 	t.tree = reconstructed
@@ -141,40 +155,43 @@ func (t *TreeService) TreeHash() string {
 	return hash
 }
 
-// ReconstructTreeFromFS reconstructs the tree from the filesystem
+// ReconstructTreeFromFS reconstructs the tree from the filesystem.
+// The slow FS scan runs without holding the write lock so readers can
+// continue serving the current tree concurrently. The lock is acquired
+// only for the fast in-memory swap and index rebuild.
 func (t *TreeService) ReconstructTreeFromFS() error {
-	return t.withLockedTree(t.reconstructTreeFromFSLocked)
+	return t.ReconstructTreeFromFSContext(context.Background())
 }
 
-func (t *TreeService) reconstructTreeFromFSLocked() error {
-	// Reconstruct the tree from the filesystem
-	// This is a more complex operation and may involve reading the filesystem structure
-	newTree, err := t.store.ReconstructTreeFromFS()
+func (t *TreeService) ReconstructTreeFromFSContext(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	newTree, err := t.store.ReconstructTreeFromFSContext(ctx)
 	if err != nil {
 		t.log.Error("Error reconstructing tree from filesystem", "error", err)
 		return err
 	}
-
-	// Defensive check to protect against unexpected nil returns from ReconstructTreeFromFS
 	if newTree == nil {
 		return fmt.Errorf("internal error: ReconstructTreeFromFS returned nil tree")
 	}
 
-	// Save the old tree in case we need to revert
-	// Note: oldTree may be nil if this is the first reconstruction (which is expected)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	oldTree := t.tree
 	t.tree = newTree
 	t.rebuildIndexesLocked()
-
-	// Reconstructed nodes already carry metadata from frontmatter or safe defaults.
-
 	if err := saveSchema(t.storageDir, CurrentSchemaVersion); err != nil {
 		t.log.Error("Error saving schema after reconstruction", "error", err)
 		t.tree = oldTree
 		t.rebuildIndexesLocked()
 		return err
 	}
-
 	return nil
 }
 
@@ -324,9 +341,9 @@ func (t *TreeService) createNodeLocked(userID string, parentID *string, title st
 	if err := t.store.SaveChildOrder(parent); err != nil {
 		rollbackErr := t.rollbackCreatedNodeLocked(parent, entry, parentWasConverted)
 		if rollbackErr != nil {
-			return nil, errors.Join(fmt.Errorf("could not persist child order: %w", err), fmt.Errorf("rollback created node: %w", rollbackErr))
+			return nil, errors.Join(fmt.Errorf(errPersistChildOrderFailed, err), fmt.Errorf("rollback created node: %w", rollbackErr))
 		}
-		return nil, fmt.Errorf("could not persist child order: %w", err)
+		return nil, fmt.Errorf(errPersistChildOrderFailed, err)
 	}
 	return &createNodeResult{
 		id:                 entry.ID,
@@ -640,7 +657,7 @@ func (t *TreeService) DeleteNode(userID string, id string, recursive bool, expec
 
 		t.reindexPositions(parent)
 		if err := t.store.SaveChildOrder(parent); err != nil {
-			return fmt.Errorf("could not persist child order: %w", err)
+			return fmt.Errorf(errPersistChildOrderFailed, err)
 		}
 		return nil
 	})
@@ -648,7 +665,13 @@ func (t *TreeService) DeleteNode(userID string, id string, recursive bool, expec
 }
 
 // UpdateNode updates a node (page/section) in the tree and syncs disk state via NodeStore.
-func (t *TreeService) UpdateNode(userID string, id string, title string, slug string, content *string, expectedVersion string, fromImport bool) error {
+// tags and properties are used for UI-originated edits: when either is non-nil
+// the content is treated as a plain body string and the provided structured
+// metadata is written alongside it via UpsertContentAndMetadata.
+// When preserveFrontmatter is true the content is treated as raw markdown with
+// embedded frontmatter (UpsertContentPreservingFrontmatter).
+// When both are absent, content is a plain body update (UpsertContent).
+func (t *TreeService) UpdateNode(userID string, id string, title string, slug string, content *string, expectedVersion string, tags []string, properties map[string]string, preserveFrontmatter bool) error {
 	return t.withLockedTree(func() error {
 		if t.tree == nil {
 			return ErrTreeNotLoaded
@@ -676,9 +699,13 @@ func (t *TreeService) UpdateNode(userID string, id string, title string, slug st
 		if content != nil {
 			t.log.Info("updating node content", "nodeID", node.ID)
 			var upsertErr error
-			if fromImport {
+			// Priority: preserveFrontmatter wins over tags/properties; callers must not set both.
+			switch {
+			case preserveFrontmatter:
 				upsertErr = t.store.UpsertContentPreservingFrontmatter(node, *content)
-			} else {
+			case tags != nil || properties != nil:
+				upsertErr = t.store.UpsertContentAndMetadata(node, *content, tags, properties)
+			default:
 				upsertErr = t.store.UpsertContent(node, *content)
 			}
 			if upsertErr != nil {
@@ -785,6 +812,23 @@ func (t *TreeService) HasPages() bool {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	return t.tree != nil && len(t.tree.Children) > 0
+}
+
+// NodeCounts returns how many page and section nodes the tree currently holds,
+// excluding the synthetic root. It reads the in-memory id index under the read
+// lock and allocates nothing, so it is cheap enough to call on every metrics
+// scrape. A node whose kind is unset is counted as a page.
+func (t *TreeService) NodeCounts() (pages, sections int) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	for _, node := range t.nodesByID {
+		if node.Kind == NodeKindSection {
+			sections++
+			continue
+		}
+		pages++
+	}
+	return pages, sections
 }
 
 // WalkNodes calls fn with the ID of every non-root node (pages and sections)
@@ -948,7 +992,7 @@ func (t *TreeService) GetPages(ids []string) ([]*Page, []error) {
 			content, raw, err := t.store.ReadPageAndRaw(tk.node)
 			mu.Lock()
 			if err != nil {
-				errs[tk.index] = fmt.Errorf("could not get page content: %w", err)
+				errs[tk.index] = fmt.Errorf(errGetPageContentFailed, err)
 			} else {
 				pages[tk.index] = &Page{PageNode: tk.node, Content: content, RawContent: raw}
 			}
@@ -977,7 +1021,7 @@ func (t *TreeService) GetPage(id string) (*Page, error) {
 
 	content, raw, err := t.store.ReadPageAndRaw(page)
 	if err != nil {
-		return nil, fmt.Errorf("could not get page content: %w", err)
+		return nil, fmt.Errorf(errGetPageContentFailed, err)
 	}
 
 	return &Page{
@@ -1062,7 +1106,7 @@ func (t *TreeService) FindPageByRoutePath(routePath string) (*Page, error) {
 
 	content, err := t.store.ReadPageContent(node)
 	if err != nil {
-		return nil, fmt.Errorf("could not get page content: %w", err)
+		return nil, fmt.Errorf(errGetPageContentFailed, err)
 	}
 
 	return &Page{
@@ -1257,8 +1301,16 @@ func (t *TreeService) EnsurePagePath(userID string, p string, targetTitle string
 	}, nil
 }
 
-// MoveNode moves a node to another parent (root if parentID is empty/"root")
+// MoveNode moves a node to another parent (root if parentID is empty/"root"),
+// appending it at the end of the new parent's children.
 func (t *TreeService) MoveNode(userID string, id string, parentID string, expectedVersion string) error {
+	return t.MoveNodeToPosition(userID, id, parentID, expectedVersion, -1)
+}
+
+// MoveNodeToPosition moves a node to another parent (root if parentID is empty/"root")
+// and inserts it at the given index among the new parent's children.
+// A negative or out-of-range position appends at the end.
+func (t *TreeService) MoveNodeToPosition(userID string, id string, parentID string, expectedVersion string, position int) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
@@ -1336,8 +1388,14 @@ func (t *TreeService) MoveNode(userID string, id string, parentID string, expect
 		}
 	}
 
-	node.Position = len(newParent.Children)
-	newParent.Children = append(newParent.Children, node)
+	insertAt := len(newParent.Children)
+	if position >= 0 && position < len(newParent.Children) {
+		insertAt = position
+	}
+	newParent.Children = append(newParent.Children, nil)
+	copy(newParent.Children[insertAt+1:], newParent.Children[insertAt:])
+	newParent.Children[insertAt] = node
+	node.Position = insertAt
 	node.Parent = newParent
 	t.rebuildChildSlugIndexForParentLocked(oldParent)
 	t.rebuildChildSlugIndexForParentLocked(newParent)
@@ -1350,7 +1408,7 @@ func (t *TreeService) MoveNode(userID string, id string, parentID string, expect
 	if err := t.store.SaveChildOrder(oldParent); err != nil {
 		rollbackErr := t.rollbackMovedNodeLocked(node, oldParent, newParent, previousOldChildren, previousOldPositions, previousNewChildren, previousNewPositions, previousPosition, previousMetadata, newParentWasConverted)
 		if rollbackErr != nil {
-			return errors.Join(fmt.Errorf("could not persist source child order: %w", err), fmt.Errorf("rollback moved node: %w", rollbackErr))
+			return errors.Join(fmt.Errorf("could not persist source child order: %w", err), fmt.Errorf(errRollbackMovedNodeFailed, rollbackErr))
 		}
 		return fmt.Errorf("could not persist source child order: %w", err)
 	}
@@ -1358,7 +1416,7 @@ func (t *TreeService) MoveNode(userID string, id string, parentID string, expect
 		if err := t.store.SaveChildOrder(newParent); err != nil {
 			rollbackErr := t.rollbackMovedNodeLocked(node, oldParent, newParent, previousOldChildren, previousOldPositions, previousNewChildren, previousNewPositions, previousPosition, previousMetadata, newParentWasConverted)
 			if rollbackErr != nil {
-				return errors.Join(fmt.Errorf("could not persist destination child order: %w", err), fmt.Errorf("rollback moved node: %w", rollbackErr))
+				return errors.Join(fmt.Errorf("could not persist destination child order: %w", err), fmt.Errorf(errRollbackMovedNodeFailed, rollbackErr))
 			}
 			return fmt.Errorf("could not persist destination child order: %w", err)
 		}
@@ -1367,7 +1425,7 @@ func (t *TreeService) MoveNode(userID string, id string, parentID string, expect
 	if err := t.store.SyncFrontmatterIfExists(node); err != nil {
 		rollbackErr := t.rollbackMovedNodeLocked(node, oldParent, newParent, previousOldChildren, previousOldPositions, previousNewChildren, previousNewPositions, previousPosition, previousMetadata, newParentWasConverted)
 		if rollbackErr != nil {
-			return errors.Join(fmt.Errorf("could not sync moved node frontmatter: %w", err), fmt.Errorf("rollback moved node: %w", rollbackErr))
+			return errors.Join(fmt.Errorf("could not sync moved node frontmatter: %w", err), fmt.Errorf(errRollbackMovedNodeFailed, rollbackErr))
 		}
 		return fmt.Errorf("could not sync moved node frontmatter: %w", err)
 	}
@@ -1450,6 +1508,33 @@ func (t *TreeService) rollbackMovedNodeLocked(node *PageNode, oldParent *PageNod
 	return rollbackErr
 }
 
+// SetPinned updates the leafwiki_pinned frontmatter field and in-memory Pinned flag.
+func (t *TreeService) SetPinned(id string, version string, pinned bool) (*Page, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if t.tree == nil {
+		return nil, ErrTreeNotLoaded
+	}
+
+	node := t.getNodeByIDLocked(id)
+	if node == nil {
+		return nil, ErrPageNotFound
+	}
+
+	if err := checkNodeVersion(node, version); err != nil {
+		return nil, err
+	}
+
+	content, err := t.store.SetPinnedFrontmatter(node, pinned)
+	if err != nil {
+		return nil, fmt.Errorf("set pinned: %w", err)
+	}
+
+	node.Pinned = pinned
+	return &Page{PageNode: node, Content: content}, nil
+}
+
 func (t *TreeService) SortPages(parentID string, orderedIDs []string) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -1523,7 +1608,7 @@ func (t *TreeService) SortPages(parentID string, orderedIDs []string) error {
 				child.Position = pos
 			}
 		}
-		return fmt.Errorf("could not persist child order: %w", err)
+		return fmt.Errorf(errPersistChildOrderFailed, err)
 	}
 
 	return nil

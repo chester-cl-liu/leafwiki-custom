@@ -14,19 +14,30 @@ import (
 )
 
 type LinksStore struct {
-	mu         sync.Mutex
+	mu         sync.RWMutex
 	storageDir string
 	filename   string
 	db         *sql.DB
 }
 
-const maxOutgoingLinksQueryArgs = 900
+const (
+	maxOutgoingLinksQueryArgs = 900
+	logCloseRowsFailed        = "could not close rows"
+	logCloseStatementFailed   = "could not close statement"
+)
 
 type PageLinkUpdate struct {
 	FromPageID string
 	FromTitle  string
 	ToPath     string
 	Targets    []TargetLink
+}
+
+type BrokenLink struct {
+	FromPageID string `json:"from_page_id"`
+	FromTitle  string `json:"from_title"`
+	FromPath   string `json:"from_path"`
+	ToPath     string `json:"to_path"`
 }
 
 func linksDatabasePath(storageDir string, filename string) string {
@@ -40,28 +51,21 @@ func NewLinksStore(storageDir string) (*LinksStore, error) {
 		filename:   "links.db",
 	}
 
-	if err := s.Connect(); err != nil {
+	// ensureSchema calls Connect() itself (idempotently), so it alone is
+	// enough to bring the store to a working state.
+	err := sqliteutil.RetryOnCorruption(linksDatabasePath(s.storageDir, s.filename), func() error {
+		if err := s.ensureSchema(); err != nil {
+			if s.db != nil {
+				_ = s.db.Close()
+				s.db = nil
+			}
+			return err
+		}
+		return nil
+	})
+	if err != nil {
 		return nil, err
 	}
-
-	if err := s.ensureSchema(); err != nil {
-		_ = s.db.Close()
-		s.db = nil
-		if !sqliteutil.IsSQLiteRecoverableError(err) {
-			return nil, err
-		}
-		slog.Default().Warn("links database corrupt, removing and retrying", "error", err)
-		sqliteutil.RemoveSQLiteFiles(linksDatabasePath(s.storageDir, s.filename))
-		if err2 := s.Connect(); err2 != nil {
-			return nil, err2
-		}
-		if err2 := s.ensureSchema(); err2 != nil {
-			_ = s.db.Close()
-			s.db = nil
-			return nil, err2
-		}
-	}
-
 	return s, nil
 }
 
@@ -71,7 +75,7 @@ func (s *LinksStore) Connect() error {
 		return nil
 	}
 	// Connect to the database
-	db, err := sql.Open("sqlite", linksDatabasePath(s.storageDir, s.filename))
+	db, err := sql.Open("sqlite", linksDatabasePath(s.storageDir, s.filename)+"?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)")
 	if err != nil {
 		return err
 	}
@@ -200,7 +204,7 @@ func (s *LinksStore) AddLinks(fromPageID string, fromTitle string, toLinks []Tar
 	}
 	defer func() {
 		if err := stmt.Close(); err != nil {
-			slog.Default().Error("could not close statement", "error", err)
+			slog.Default().Error(logCloseStatementFailed, "error", err)
 		}
 	}()
 
@@ -252,7 +256,7 @@ func (s *LinksStore) replaceLinksAndHealTx(tx *sql.Tx, updates []PageLinkUpdate)
 	}
 	defer func() {
 		if err := deleteStmt.Close(); err != nil {
-			slog.Default().Error("could not close statement", "error", err)
+			slog.Default().Error(logCloseStatementFailed, "error", err)
 		}
 	}()
 
@@ -262,7 +266,7 @@ func (s *LinksStore) replaceLinksAndHealTx(tx *sql.Tx, updates []PageLinkUpdate)
 	}
 	defer func() {
 		if err := insertStmt.Close(); err != nil {
-			slog.Default().Error("could not close statement", "error", err)
+			slog.Default().Error(logCloseStatementFailed, "error", err)
 		}
 	}()
 
@@ -276,7 +280,7 @@ func (s *LinksStore) replaceLinksAndHealTx(tx *sql.Tx, updates []PageLinkUpdate)
 	}
 	defer func() {
 		if err := healStmt.Close(); err != nil {
-			slog.Default().Error("could not close statement", "error", err)
+			slog.Default().Error(logCloseStatementFailed, "error", err)
 		}
 	}()
 
@@ -306,15 +310,15 @@ func (s *LinksStore) replaceLinksAndHealTx(tx *sql.Tx, updates []PageLinkUpdate)
 }
 
 func (s *LinksStore) GetBacklinksForPage(pageID string) ([]Backlink, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	rows, err := s.db.Query(`SELECT from_page_id, to_page_id, from_title FROM links WHERE to_page_id = ? and broken = 0`, pageID)
 	if err != nil {
 		return nil, err
 	}
 	defer func() {
 		if err := rows.Close(); err != nil {
-			slog.Default().Error("could not close rows", "error", err)
+			slog.Default().Error(logCloseRowsFailed, "error", err)
 		}
 	}()
 
@@ -340,8 +344,8 @@ func (s *LinksStore) GetBacklinksForPage(pageID string) ([]Backlink, error) {
 }
 
 func (s *LinksStore) GetOutgoingLinksForPage(pageID string) ([]Outgoing, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 
 	rows, err := s.db.Query(`
         SELECT from_page_id, to_page_id, to_path, from_title, broken
@@ -353,7 +357,7 @@ func (s *LinksStore) GetOutgoingLinksForPage(pageID string) ([]Outgoing, error) 
 	}
 	defer func() {
 		if err := rows.Close(); err != nil {
-			slog.Default().Error("could not close rows", "error", err)
+			slog.Default().Error(logCloseRowsFailed, "error", err)
 		}
 	}()
 
@@ -384,8 +388,8 @@ func (s *LinksStore) GetOutgoingLinksForPage(pageID string) ([]Outgoing, error) 
 }
 
 func (s *LinksStore) GetOutgoingLinksForPages(pageIDs []string) (map[string][]Outgoing, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 
 	if len(pageIDs) == 0 {
 		return map[string][]Outgoing{}, nil
@@ -424,7 +428,7 @@ func (s *LinksStore) appendOutgoingLinksForPageBatch(outgoingByPageID map[string
 	}
 	defer func() {
 		if err := rows.Close(); err != nil {
-			slog.Default().Error("could not close rows", "error", err)
+			slog.Default().Error(logCloseRowsFailed, "error", err)
 		}
 	}()
 
@@ -448,8 +452,8 @@ func (s *LinksStore) appendOutgoingLinksForPageBatch(outgoingByPageID map[string
 }
 
 func (s *LinksStore) GetRefactorMatchesForPrefix(oldPrefix string) ([]RefactorLinkMatch, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 
 	rows, err := s.db.Query(`
 		SELECT from_page_id, from_title, to_path, broken
@@ -461,7 +465,7 @@ func (s *LinksStore) GetRefactorMatchesForPrefix(oldPrefix string) ([]RefactorLi
 	}
 	defer func() {
 		if err := rows.Close(); err != nil {
-			slog.Default().Error("could not close rows", "error", err)
+			slog.Default().Error(logCloseRowsFailed, "error", err)
 		}
 	}()
 
@@ -483,8 +487,8 @@ func (s *LinksStore) GetRefactorMatchesForPrefix(oldPrefix string) ([]RefactorLi
 }
 
 func (s *LinksStore) GetRefactorSourcePageIDsForPrefix(oldPrefix string) ([]string, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 
 	rows, err := s.db.Query(`
 		SELECT DISTINCT from_page_id
@@ -496,7 +500,7 @@ func (s *LinksStore) GetRefactorSourcePageIDsForPrefix(oldPrefix string) ([]stri
 	}
 	defer func() {
 		if err := rows.Close(); err != nil {
-			slog.Default().Error("could not close rows", "error", err)
+			slog.Default().Error(logCloseRowsFailed, "error", err)
 		}
 	}()
 
@@ -516,8 +520,8 @@ func (s *LinksStore) GetRefactorSourcePageIDsForPrefix(oldPrefix string) ([]stri
 }
 
 func (s *LinksStore) GetRefactorSourcePageIDsForWikiLinkTitle(title string) ([]string, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 
 	rows, err := s.db.Query(`
 		SELECT DISTINCT from_page_id
@@ -529,7 +533,7 @@ func (s *LinksStore) GetRefactorSourcePageIDsForWikiLinkTitle(title string) ([]s
 	}
 	defer func() {
 		if err := rows.Close(); err != nil {
-			slog.Default().Error("could not close rows", "error", err)
+			slog.Default().Error(logCloseRowsFailed, "error", err)
 		}
 	}()
 
@@ -549,8 +553,8 @@ func (s *LinksStore) GetRefactorSourcePageIDsForWikiLinkTitle(title string) ([]s
 }
 
 func (s *LinksStore) GetBrokenIncomingForPath(toPath string) ([]Backlink, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 
 	rows, err := s.db.Query(`
 		SELECT from_page_id, to_page_id, from_title
@@ -563,7 +567,7 @@ func (s *LinksStore) GetBrokenIncomingForPath(toPath string) ([]Backlink, error)
 	}
 	defer func() {
 		if err := rows.Close(); err != nil {
-			slog.Default().Error("could not close rows", "error", err)
+			slog.Default().Error(logCloseRowsFailed, "error", err)
 		}
 	}()
 
@@ -616,6 +620,46 @@ func (s *LinksStore) HealWikiLinksForTitle(title string, pageID string) error {
 	`, pageID, strings.ToLower(wikilinkSentinelPrefix+title))
 
 	return err
+}
+
+func (s *LinksStore) GetBrokenLinks() ([]BrokenLink, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	rows, err := s.db.Query(`
+        SELECT from_page_id, from_title, to_path
+        FROM links
+        WHERE broken = 1
+        ORDER BY to_path, from_title
+    `)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		_ = rows.Close()
+	}()
+
+	var result []BrokenLink
+
+	for rows.Next() {
+		var link BrokenLink
+
+		if err := rows.Scan(
+			&link.FromPageID,
+			&link.FromTitle,
+			&link.ToPath,
+		); err != nil {
+			return nil, err
+		}
+
+		result = append(result, link)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return result, nil
 }
 
 func (s *LinksStore) Clear() error {

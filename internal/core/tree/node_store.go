@@ -1,6 +1,7 @@
 package tree
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/perber/wiki/internal/core/ignore"
 	"github.com/perber/wiki/internal/core/markdown"
 	"github.com/perber/wiki/internal/core/shared"
 )
@@ -20,16 +22,21 @@ func fileExists(p string) bool {
 	return err == nil
 }
 
-func ensureUniqueReconstructedID(seenIDs map[string]string, id string, path string) error {
+// ensureUniqueReconstructedID records id as seen for this reconstruct walk.
+// It returns the path of the earlier occurrence if id is a duplicate (the
+// caller should skip this node rather than add it to the tree), or an error
+// only if id is empty (defensive — callers always default to a freshly
+// generated ID before this is called, so this should be unreachable).
+func ensureUniqueReconstructedID(seenIDs map[string]string, id string, path string) (conflictPath string, err error) {
 	trimmedID := strings.TrimSpace(id)
 	if trimmedID == "" {
-		return fmt.Errorf("reconstruct tree from fs: empty leafwiki_id at %s", path)
+		return "", fmt.Errorf("reconstruct tree from fs: empty leafwiki_id at %s", path)
 	}
 	if existingPath, exists := seenIDs[trimmedID]; exists {
-		return fmt.Errorf("duplicate leafwiki_id %q in %s and %s", trimmedID, existingPath, path)
+		return existingPath, nil
 	}
 	seenIDs[trimmedID] = path
-	return nil
+	return "", nil
 }
 
 func ensureUniqueReconstructedSlug(seenSlugs map[string]string, slug string, path string) error {
@@ -58,13 +65,33 @@ type ResolvedNode struct {
 }
 
 type NodeStore struct {
-	storageDir string
-	log        *slog.Logger
-	slugger    *SlugService
+	storageDir  string
+	log         *slog.Logger
+	slugger     *SlugService
+	ignoreCache *ignore.Cache
 }
 
-const reconstructSystemUserID = "system"
-const orderFilename = ".order.json"
+// SetIgnoreCache sets the ignore cache to use for multi-level ignore resolution.
+func (f *NodeStore) SetIgnoreCache(ignoreCache *ignore.Cache) {
+	f.ignoreCache = ignoreCache
+}
+
+const (
+	reconstructSystemUserID    = "system"
+	orderFilename              = ".order.json"
+	indexFilename              = "index.md"
+	errEntryRequired           = "an entry is required"
+	errParentEntryRequired     = "a parent entry is required"
+	errExpectedPageMissing     = "expected page file missing"
+	errExpectedFolderMissing   = "expected folder missing"
+	errExpectedFolderFoundFile = "expected folder but found file"
+	errExpectedFileMissing     = "expected file missing"
+	errExpectedFileFoundFolder = "expected file but found folder"
+	errUnknownNodeKind         = "unknown node kind: %q"
+	errLoadMarkdownFailed      = "could not load markdown file: %w"
+	errWriteMarkdownFailed     = "could not write markdown file: %w"
+	errEnsureParentFailed      = "could not ensure parent directory exists: %w"
+)
 
 type childOrderFile struct {
 	OrderedIDs []string `json:"ordered_ids"`
@@ -119,7 +146,7 @@ func (f *NodeStore) syncManagedFrontmatter(mdFile *markdown.MarkdownFile, entry 
 
 func (f *NodeStore) ensureSectionIndex(entry *PageNode) (string, error) {
 	if entry == nil {
-		return "", &InvalidOpError{Op: "ensureSectionIndex", Reason: "an entry is required"}
+		return "", &InvalidOpError{Op: "ensureSectionIndex", Reason: errEntryRequired}
 	}
 	if entry.Kind != NodeKindSection {
 		return "", &InvalidOpError{Op: "ensureSectionIndex", Reason: "entry must be a section"}
@@ -134,13 +161,13 @@ func (f *NodeStore) ensureSectionIndex(entry *PageNode) (string, error) {
 	if fileExists(filePath) {
 		mdFile, err = markdown.LoadMarkdownFile(filePath)
 		if err != nil {
-			return "", fmt.Errorf("could not load markdown file: %w", err)
+			return "", fmt.Errorf(errLoadMarkdownFailed, err)
 		}
 	}
 
 	f.syncManagedFrontmatter(mdFile, entry)
 	if err := mdFile.WriteToFile(); err != nil {
-		return "", fmt.Errorf("could not write markdown file: %w", err)
+		return "", fmt.Errorf(errWriteMarkdownFailed, err)
 	}
 
 	return filePath, nil
@@ -237,6 +264,10 @@ func (f *NodeStore) LoadTree(filename string) (*PageNode, error) {
 }
 
 func (f *NodeStore) ReconstructTreeFromFS() (*PageNode, error) {
+	return f.ReconstructTreeFromFSContext(context.Background())
+}
+
+func (f *NodeStore) ReconstructTreeFromFSContext(ctx context.Context) (*PageNode, error) {
 	reconstructNow := time.Now().UTC()
 	rootDir := filepath.Join(f.storageDir, "root")
 	root := &PageNode{
@@ -264,13 +295,21 @@ func (f *NodeStore) ReconstructTreeFromFS() (*PageNode, error) {
 		return nil, fmt.Errorf("root path %s is not a directory", rootDir)
 	}
 
-	if err := f.reconstructTreeRecursive(rootDir, root, reconstructNow, seenIDs); err != nil {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	if err := f.reconstructTreeRecursive(ctx, rootDir, root, reconstructNow, seenIDs); err != nil {
 		return nil, fmt.Errorf("reconstruct tree from fs: %w", err)
 	}
 
 	return root, nil
 }
-func (f *NodeStore) reconstructTreeRecursive(currentPath string, parent *PageNode, reconstructNow time.Time, seenIDs map[string]string) error {
+func (f *NodeStore) reconstructTreeRecursive(ctx context.Context, currentPath string, parent *PageNode, reconstructNow time.Time, seenIDs map[string]string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
 	entries, err := os.ReadDir(currentPath)
 	if err != nil {
 		return fmt.Errorf("read dir %s: %w", currentPath, err)
@@ -288,11 +327,23 @@ func (f *NodeStore) reconstructTreeRecursive(currentPath string, parent *PageNod
 	})
 
 	for _, entry := range entries {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
 		name := entry.Name()
 
 		// optional: skip hidden stuff
 		if strings.HasPrefix(name, ".") {
 			continue
+		}
+
+		// Check .leafwikiignore
+		if ig := f.getIgnoreForDir(currentPath); ig != nil {
+			relPath, _ := filepath.Rel(filepath.Join(f.storageDir, "root"), filepath.Join(currentPath, name))
+			if relPath != "" && ig.Matches(filepath.ToSlash(relPath), entry.IsDir()) {
+				continue
+			}
 		}
 
 		// defaults
@@ -309,9 +360,10 @@ func (f *NodeStore) reconstructTreeRecursive(currentPath string, parent *PageNod
 				continue
 			}
 
-			indexPath := filepath.Join(currentPath, name, "index.md")
+			indexPath := filepath.Join(currentPath, name, indexFilename)
 			var sectionMdFile *markdown.MarkdownFile
 			needsWriteback := false
+			sectionPinned := false
 			if fileExists(indexPath) {
 				mdFile, err := markdown.LoadMarkdownFile(indexPath)
 				if err != nil {
@@ -319,6 +371,9 @@ func (f *NodeStore) reconstructTreeRecursive(currentPath string, parent *PageNod
 					// fall back to default title and generated ID, but still add the section and recurse
 				} else {
 					fm := mdFile.GetFrontmatter()
+					if fm.WasRepaired() {
+						f.log.Warn("frontmatter did not parse as-is and was auto-repaired", "path", indexPath)
+					}
 					metadata = f.metadataFromFrontmatter(fm, reconstructNow, indexPath)
 					title, err = mdFile.GetTitle()
 					if err != nil {
@@ -332,6 +387,7 @@ func (f *NodeStore) reconstructTreeRecursive(currentPath string, parent *PageNod
 						sectionMdFile = mdFile
 						needsWriteback = true
 					}
+					sectionPinned = fm.LeafWikiPinned
 				}
 			}
 
@@ -344,12 +400,19 @@ func (f *NodeStore) reconstructTreeRecursive(currentPath string, parent *PageNod
 				Children: []*PageNode{},
 				Kind:     NodeKindSection,
 				Metadata: metadata,
+				Pinned:   sectionPinned,
 			}
 			if err := ensureUniqueReconstructedSlug(seenSlugs, child.Slug, filepath.Join(currentPath, name)); err != nil {
 				return err
 			}
-			if err := ensureUniqueReconstructedID(seenIDs, child.ID, indexPath); err != nil {
+			conflictPath, err := ensureUniqueReconstructedID(seenIDs, child.ID, indexPath)
+			if err != nil {
 				return err
+			}
+			if conflictPath != "" {
+				f.log.Warn("skipping section: duplicate leafwiki_id, keeping first occurrence",
+					"leafwikiID", child.ID, "path", indexPath, "conflictingPath", conflictPath)
+				continue
 			}
 			parent.Children = append(parent.Children, child)
 
@@ -363,7 +426,7 @@ func (f *NodeStore) reconstructTreeRecursive(currentPath string, parent *PageNod
 				}
 			}
 
-			if err := f.reconstructTreeRecursive(filepath.Join(currentPath, name), child, reconstructNow, seenIDs); err != nil {
+			if err := f.reconstructTreeRecursive(ctx, filepath.Join(currentPath, name), child, reconstructNow, seenIDs); err != nil {
 				return err
 			}
 			continue
@@ -393,6 +456,9 @@ func (f *NodeStore) reconstructTreeRecursive(currentPath string, parent *PageNod
 			continue
 		}
 		fm := mdFile.GetFrontmatter()
+		if fm.WasRepaired() {
+			f.log.Warn("frontmatter did not parse as-is and was auto-repaired", "path", filePath)
+		}
 		metadata = f.metadataFromFrontmatter(fm, reconstructNow, filePath)
 		title, err = mdFile.GetTitle()
 		if err != nil {
@@ -413,12 +479,19 @@ func (f *NodeStore) reconstructTreeRecursive(currentPath string, parent *PageNod
 			Children: nil,
 			Kind:     NodeKindPage,
 			Metadata: metadata,
+			Pinned:   fm.LeafWikiPinned,
 		}
 		if err := ensureUniqueReconstructedSlug(seenSlugs, child.Slug, filePath); err != nil {
 			return err
 		}
-		if err := ensureUniqueReconstructedID(seenIDs, child.ID, filePath); err != nil {
+		conflictPath, err := ensureUniqueReconstructedID(seenIDs, child.ID, filePath)
+		if err != nil {
 			return err
+		}
+		if conflictPath != "" {
+			f.log.Warn("skipping page: duplicate leafwiki_id, keeping first occurrence",
+				"leafwikiID", child.ID, "path", filePath, "conflictingPath", conflictPath)
+			continue
 		}
 		if needsWriteback {
 			f.writeReconstructedFrontmatter(mdFile, child)
@@ -491,7 +564,7 @@ func (f *NodeStore) readChildOrder(dirPath string) (*childOrderFile, error) {
 
 func (f *NodeStore) SaveChildOrder(parent *PageNode) error {
 	if parent == nil {
-		return &InvalidOpError{Op: "SaveChildOrder", Reason: "a parent entry is required"}
+		return &InvalidOpError{Op: "SaveChildOrder", Reason: errParentEntryRequired}
 	}
 	if parent.ID != "root" && parent.Kind != NodeKindSection {
 		return &InvalidOpError{Op: "SaveChildOrder", Reason: "parent entry must be root or a section"}
@@ -502,7 +575,7 @@ func (f *NodeStore) SaveChildOrder(parent *PageNode) error {
 		return err
 	}
 	if err := os.MkdirAll(dirPath, 0o755); err != nil {
-		return fmt.Errorf("could not ensure parent directory exists: %w", err)
+		return fmt.Errorf(errEnsureParentFailed, err)
 	}
 
 	orderedIDs := make([]string, 0, len(parent.Children))
@@ -536,7 +609,7 @@ func (f *NodeStore) assignParentToChildren(parent *PageNode) {
 // CreatePage creates a new page file under the given parent entry
 func (f *NodeStore) CreatePage(parentEntry *PageNode, newEntry *PageNode) error {
 	if parentEntry == nil {
-		return &InvalidOpError{Op: "CreatePage", Reason: "a parent entry is required"}
+		return &InvalidOpError{Op: "CreatePage", Reason: errParentEntryRequired}
 	}
 	if newEntry == nil {
 		return &InvalidOpError{Op: "CreatePage", Reason: "a new entry is required"}
@@ -561,11 +634,18 @@ func (f *NodeStore) CreatePage(parentEntry *PageNode, newEntry *PageNode) error 
 
 	// Ensure the parent directory exists (idempotent)
 	if err := os.MkdirAll(parentDir, 0o755); err != nil {
-		return fmt.Errorf("could not ensure parent directory exists: %w", err)
+		return fmt.Errorf(errEnsureParentFailed, err)
 	}
 
 	// Destination paths
 	destBase := filepath.Join(parentDir, newEntry.Slug)
+
+	// Guard against ignored paths
+	rel, _ := filepath.Rel(filepath.Join(f.storageDir, "root"), destBase)
+	if f.isPathIgnored(rel, false) {
+		return &InvalidOpError{Op: "CreatePage", Reason: "target path matches .leafwikiignore"}
+	}
+
 	destFile := destBase + ".md"
 	destDir := destBase
 
@@ -583,10 +663,10 @@ func (f *NodeStore) CreatePage(parentEntry *PageNode, newEntry *PageNode) error 
 	return nil
 }
 
-// CreateSection creates a new section (folder) under the given parent entry.
+// CreateSection creates a new section (folder) under the given paren
 func (f *NodeStore) CreateSection(parentEntry *PageNode, newEntry *PageNode) error {
 	if parentEntry == nil {
-		return &InvalidOpError{Op: "CreateSection", Reason: "a parent entry is required"}
+		return &InvalidOpError{Op: "CreateSection", Reason: errParentEntryRequired}
 	}
 	if newEntry == nil {
 		return &InvalidOpError{Op: "CreateSection", Reason: "a new entry is required"}
@@ -611,11 +691,18 @@ func (f *NodeStore) CreateSection(parentEntry *PageNode, newEntry *PageNode) err
 
 	// Ensure parent directory exists (idempotent)
 	if err := os.MkdirAll(parentDir, 0o755); err != nil {
-		return fmt.Errorf("could not ensure parent directory exists: %w", err)
+		return fmt.Errorf(errEnsureParentFailed, err)
 	}
 
 	// Destination base paths
 	destBase := filepath.Join(parentDir, newEntry.Slug)
+
+	// Guard against ignored paths
+	rel, _ := filepath.Rel(filepath.Join(f.storageDir, "root"), destBase)
+	if f.isPathIgnored(rel, true) {
+		return &InvalidOpError{Op: "CreateSection", Reason: "target path matches .leafwikiignore"}
+	}
+
 	destFile := destBase + ".md"
 	destDir := destBase
 
@@ -643,7 +730,7 @@ func (f *NodeStore) CreateSection(parentEntry *PageNode, newEntry *PageNode) err
 // It creates the file if it does not exist also for sections (index.md).
 func (f *NodeStore) UpsertContent(entry *PageNode, content string) error {
 	if entry == nil {
-		return &InvalidOpError{Op: "UpsertContent", Reason: "an entry is required"}
+		return &InvalidOpError{Op: "UpsertContent", Reason: errEntryRequired}
 	}
 
 	filePath, err := f.contentPathForNodeWrite(entry)
@@ -655,14 +742,14 @@ func (f *NodeStore) UpsertContent(entry *PageNode, content string) error {
 	if fileExists(filePath) {
 		mdFile, err = markdown.LoadMarkdownFile(filePath)
 		if err != nil {
-			return fmt.Errorf("could not load markdown file: %w", err)
+			return fmt.Errorf(errLoadMarkdownFailed, err)
 		}
 	}
 
 	mdFile.SetContent(content)
 	f.syncManagedFrontmatter(mdFile, entry)
 	if err := mdFile.WriteToFile(); err != nil {
-		return fmt.Errorf("could not write markdown file: %w", err)
+		return fmt.Errorf(errWriteMarkdownFailed, err)
 	}
 
 	return nil
@@ -673,7 +760,7 @@ func (f *NodeStore) UpsertContent(entry *PageNode, content string) error {
 // fields into the system-managed frontmatter block written to disk.
 func (f *NodeStore) UpsertContentPreservingFrontmatter(entry *PageNode, content string) error {
 	if entry == nil {
-		return &InvalidOpError{Op: "UpsertContentPreservingFrontmatter", Reason: "an entry is required"}
+		return &InvalidOpError{Op: "UpsertContentPreservingFrontmatter", Reason: errEntryRequired}
 	}
 
 	filePath, err := f.contentPathForNodeWrite(entry)
@@ -685,7 +772,7 @@ func (f *NodeStore) UpsertContentPreservingFrontmatter(entry *PageNode, content 
 	if fileExists(filePath) {
 		mdFile, err = markdown.LoadMarkdownFile(filePath)
 		if err != nil {
-			return fmt.Errorf("could not load markdown file: %w", err)
+			return fmt.Errorf(errLoadMarkdownFailed, err)
 		}
 	}
 
@@ -694,7 +781,92 @@ func (f *NodeStore) UpsertContentPreservingFrontmatter(entry *PageNode, content 
 	}
 	f.syncManagedFrontmatter(mdFile, entry)
 	if err := mdFile.WriteToFile(); err != nil {
-		return fmt.Errorf("could not write markdown file: %w", err)
+		return fmt.Errorf(errWriteMarkdownFailed, err)
+	}
+
+	return nil
+}
+
+// UpsertContentAndMetadata is the UI-edit path: it replaces the body and the
+// editor-visible frontmatter (tags and string-typed properties) while keeping
+// system-managed frontmatter (leafwiki_*) and non-string pass-through fields
+// (booleans, numbers, non-tag lists) intact.
+//
+// Ownership rules for ExtraFields:
+//   - String-valued keys are editor-owned: only keys present in properties
+//     survive; keys absent from properties are removed.
+//   - Non-string, non-map values (bool, int, float64, []interface{}) are
+//     always preserved — the editor cannot represent them, so it cannot
+//     intentionally delete them.
+//   - Nested maps (map[string]interface{}) are not preserved; their string
+//     leaves round-trip through the editor as dot-notation property keys.
+//   - Tags: when tags is non-nil the existing tags are replaced; when tags is
+//     nil the existing tags in the file are left unchanged.
+func (f *NodeStore) UpsertContentAndMetadata(
+	entry *PageNode,
+	body string,
+	tags []string,
+	properties map[string]string,
+) error {
+	if entry == nil {
+		return &InvalidOpError{Op: "UpsertContentAndMetadata", Reason: errEntryRequired}
+	}
+
+	filePath, err := f.contentPathForNodeWrite(entry)
+	if err != nil {
+		return err
+	}
+
+	mdFile := markdown.NewMarkdownFile(filePath, "", markdown.Frontmatter{})
+	if fileExists(filePath) {
+		mdFile, err = markdown.LoadMarkdownFile(filePath)
+		if err != nil {
+			return fmt.Errorf(errLoadMarkdownFailed, err)
+		}
+	}
+
+	mdFile.SetContent(body)
+
+	existing := mdFile.GetFrontmatter().ExtraFields
+	extra := make(map[string]interface{}, len(properties)+len(existing)+1)
+
+	// Preserve non-string, non-map ExtraFields (bool, int, float64, non-tag
+	// lists). The editor cannot represent these types and never sends them back,
+	// so they must survive an edit unchanged.
+	for k, v := range existing {
+		if k == "tags" {
+			continue // handled separately below
+		}
+		switch v.(type) {
+		case string, map[string]interface{}:
+			// string: editor-owned, replaced by incoming properties
+			// map: nested YAML — string leaves round-trip via dot-notation keys
+		default:
+			extra[k] = v
+		}
+	}
+
+	// String properties from the editor replace every editor-owned string key.
+	for k, v := range properties {
+		extra[k] = v
+	}
+
+	// Tags: replace when the caller sends an explicit list; preserve otherwise.
+	if tags != nil {
+		tagList := make([]interface{}, len(tags))
+		for i, t := range tags {
+			tagList[i] = t
+		}
+		extra["tags"] = tagList
+	} else if existingTags, ok := existing["tags"]; ok {
+		extra["tags"] = existingTags
+	}
+
+	mdFile.SetExtraFields(extra)
+
+	f.syncManagedFrontmatter(mdFile, entry)
+	if err := mdFile.WriteToFile(); err != nil {
+		return fmt.Errorf(errWriteMarkdownFailed, err)
 	}
 
 	return nil
@@ -703,10 +875,10 @@ func (f *NodeStore) UpsertContentPreservingFrontmatter(entry *PageNode, content 
 // MoveNode moves a page to a other node
 func (f *NodeStore) MoveNode(entry *PageNode, parentEntry *PageNode) error {
 	if entry == nil {
-		return &InvalidOpError{Op: "MoveNode", Reason: "an entry is required"}
+		return &InvalidOpError{Op: "MoveNode", Reason: errEntryRequired}
 	}
 	if parentEntry == nil {
-		return &InvalidOpError{Op: "MoveNode", Reason: "a parent entry is required"}
+		return &InvalidOpError{Op: "MoveNode", Reason: errParentEntryRequired}
 	}
 	if entry.ID == "root" {
 		return &InvalidOpError{Op: "MoveNode", Reason: "cannot move root"}
@@ -724,7 +896,7 @@ func (f *NodeStore) MoveNode(entry *PageNode, parentEntry *PageNode) error {
 	}
 
 	if err := os.MkdirAll(parentDir, 0o755); err != nil {
-		return fmt.Errorf("could not ensure parent directory exists: %w", err)
+		return fmt.Errorf(errEnsureParentFailed, err)
 	}
 
 	// Current base path from tree (still at old location; TreeService updates Parent after success)
@@ -737,6 +909,13 @@ func (f *NodeStore) MoveNode(entry *PageNode, parentEntry *PageNode) error {
 
 	// Destination base path (same slug, under new parent)
 	destBase := filepath.Join(parentDir, entry.Slug)
+
+	// Guard against ignored paths
+	rel, _ := filepath.Rel(filepath.Join(f.storageDir, "root"), destBase)
+	if f.isPathIgnored(rel, entry.Kind == NodeKindSection) {
+		return &InvalidOpError{Op: "MoveNode", Reason: "target path matches .leafwikiignore"}
+	}
+
 	destFile := destBase + ".md"
 	destDir := destBase
 
@@ -753,13 +932,13 @@ func (f *NodeStore) MoveNode(entry *PageNode, parentEntry *PageNode) error {
 		if err != nil {
 			if os.IsNotExist(err) {
 				f.log.Warn("move drift: expected folder missing", "nodeID", entry.ID, "expectedDir", oldDir)
-				return &DriftError{NodeID: entry.ID, Kind: entry.Kind, Path: oldDir, Reason: "expected folder missing"}
+				return &DriftError{NodeID: entry.ID, Kind: entry.Kind, Path: oldDir, Reason: errExpectedFolderMissing}
 			}
 			return fmt.Errorf("stat source dir: %w", err)
 		}
 		if !info.IsDir() {
 			f.log.Warn("move drift: expected folder but found file", "nodeID", entry.ID, "expectedDir", oldDir)
-			return &DriftError{NodeID: entry.ID, Kind: entry.Kind, Path: oldDir, Reason: "expected folder but found file"}
+			return &DriftError{NodeID: entry.ID, Kind: entry.Kind, Path: oldDir, Reason: errExpectedFolderFoundFile}
 		}
 
 		if err := os.Rename(oldDir, destDir); err != nil {
@@ -772,13 +951,13 @@ func (f *NodeStore) MoveNode(entry *PageNode, parentEntry *PageNode) error {
 		if err != nil {
 			if os.IsNotExist(err) {
 				f.log.Warn("move drift: expected file missing", "nodeID", entry.ID, "expectedFile", oldFile)
-				return &DriftError{NodeID: entry.ID, Kind: entry.Kind, Path: oldFile, Reason: "expected file missing"}
+				return &DriftError{NodeID: entry.ID, Kind: entry.Kind, Path: oldFile, Reason: errExpectedFileMissing}
 			}
 			return fmt.Errorf("stat source file: %w", err)
 		}
 		if info.IsDir() {
 			f.log.Warn("move drift: expected file but found folder", "nodeID", entry.ID, "expectedFile", oldFile)
-			return &DriftError{NodeID: entry.ID, Kind: entry.Kind, Path: oldFile, Reason: "expected file but found folder"}
+			return &DriftError{NodeID: entry.ID, Kind: entry.Kind, Path: oldFile, Reason: errExpectedFileFoundFolder}
 		}
 
 		if err := os.Rename(oldFile, destFile); err != nil {
@@ -786,7 +965,7 @@ func (f *NodeStore) MoveNode(entry *PageNode, parentEntry *PageNode) error {
 		}
 
 	default:
-		return &InvalidOpError{Op: "MoveNode", Reason: fmt.Sprintf("unknown node kind: %q", entry.Kind)}
+		return &InvalidOpError{Op: "MoveNode", Reason: fmt.Sprintf(errUnknownNodeKind, entry.Kind)}
 	}
 
 	return nil
@@ -795,7 +974,7 @@ func (f *NodeStore) MoveNode(entry *PageNode, parentEntry *PageNode) error {
 // DeletePage deletes a page file from disk
 func (f *NodeStore) DeletePage(entry *PageNode) error {
 	if entry == nil {
-		return &InvalidOpError{Op: "DeletePage", Reason: "an entry is required"}
+		return &InvalidOpError{Op: "DeletePage", Reason: errEntryRequired}
 	}
 	if entry.ID == "root" {
 		return &InvalidOpError{Op: "DeletePage", Reason: "cannot delete root"}
@@ -814,13 +993,13 @@ func (f *NodeStore) DeletePage(entry *PageNode) error {
 	if err != nil {
 		if os.IsNotExist(err) {
 			f.log.Warn("delete drift: expected page file missing", "nodeID", entry.ID, "expectedFile", file)
-			return &DriftError{NodeID: entry.ID, Kind: entry.Kind, Path: file, Reason: "expected file missing"}
+			return &DriftError{NodeID: entry.ID, Kind: entry.Kind, Path: file, Reason: errExpectedFileMissing}
 		}
 		return fmt.Errorf("stat file: %w", err)
 	}
 	if info.IsDir() {
 		f.log.Warn("delete drift: expected file but found folder", "nodeID", entry.ID, "expectedFile", file)
-		return &DriftError{NodeID: entry.ID, Kind: entry.Kind, Path: file, Reason: "expected file but found folder"}
+		return &DriftError{NodeID: entry.ID, Kind: entry.Kind, Path: file, Reason: errExpectedFileFoundFolder}
 	}
 
 	if err := os.Remove(file); err != nil {
@@ -833,7 +1012,7 @@ func (f *NodeStore) DeletePage(entry *PageNode) error {
 // DeleteSection deletes a section folder from disk
 func (f *NodeStore) DeleteSection(entry *PageNode) error {
 	if entry == nil {
-		return &InvalidOpError{Op: "DeleteSection", Reason: "an entry is required"}
+		return &InvalidOpError{Op: "DeleteSection", Reason: errEntryRequired}
 	}
 	if entry.ID == "root" {
 		return &InvalidOpError{Op: "DeleteSection", Reason: "cannot delete root"}
@@ -851,13 +1030,13 @@ func (f *NodeStore) DeleteSection(entry *PageNode) error {
 	if err != nil {
 		if os.IsNotExist(err) {
 			f.log.Warn("delete drift: expected section folder missing", "nodeID", entry.ID, "expectedDir", dir)
-			return &DriftError{NodeID: entry.ID, Kind: entry.Kind, Path: dir, Reason: "expected folder missing"}
+			return &DriftError{NodeID: entry.ID, Kind: entry.Kind, Path: dir, Reason: errExpectedFolderMissing}
 		}
 		return fmt.Errorf("stat dir: %w", err)
 	}
 	if !info.IsDir() {
 		f.log.Warn("delete drift: expected folder but found file", "nodeID", entry.ID, "expectedDir", dir)
-		return &DriftError{NodeID: entry.ID, Kind: entry.Kind, Path: dir, Reason: "expected folder but found file"}
+		return &DriftError{NodeID: entry.ID, Kind: entry.Kind, Path: dir, Reason: errExpectedFolderFoundFile}
 	}
 
 	if err := os.RemoveAll(dir); err != nil {
@@ -870,7 +1049,7 @@ func (f *NodeStore) DeleteSection(entry *PageNode) error {
 // RenameNode renames a node's slug on disk
 func (f *NodeStore) RenameNode(entry *PageNode, newSlug string) error {
 	if entry == nil {
-		return &InvalidOpError{Op: "RenameNode", Reason: "an entry is required"}
+		return &InvalidOpError{Op: "RenameNode", Reason: errEntryRequired}
 	}
 	if strings.TrimSpace(newSlug) == "" {
 		return &InvalidOpError{Op: "RenameNode", Reason: "new slug must not be empty"}
@@ -891,6 +1070,12 @@ func (f *NodeStore) RenameNode(entry *PageNode, newSlug string) error {
 	// new base path: same parent dir, last segment replaced
 	newBase := filepath.Join(filepath.Dir(oldBase), newSlug)
 
+	// Guard against ignored paths
+	rel, _ := filepath.Rel(filepath.Join(f.storageDir, "root"), newBase)
+	if f.isPathIgnored(rel, entry.Kind == NodeKindSection) {
+		return &InvalidOpError{Op: "RenameNode", Reason: "target path matches .leafwikiignore"}
+	}
+
 	// destination collision checks
 	if fileExists(newBase+".md") || fileExists(newBase) {
 		return &PageAlreadyExistsError{Path: newBase}
@@ -905,14 +1090,14 @@ func (f *NodeStore) RenameNode(entry *PageNode, newSlug string) error {
 		info, err := os.Stat(srcDir)
 		if err != nil {
 			if os.IsNotExist(err) {
-				return &DriftError{NodeID: entry.ID, Kind: entry.Kind, Path: srcDir, Reason: "expected folder missing"}
+				return &DriftError{NodeID: entry.ID, Kind: entry.Kind, Path: srcDir, Reason: errExpectedFolderMissing}
 			}
 			return fmt.Errorf("stat source dir: %w", err)
 		}
 		if !info.IsDir() {
 			// drift: tree says section but disk is not a folder
 			f.log.Warn("drift: tree says section but disk is not a folder", "srcDir", srcDir)
-			return &DriftError{NodeID: entry.ID, Kind: entry.Kind, Path: srcDir, Reason: "expected folder but found file"}
+			return &DriftError{NodeID: entry.ID, Kind: entry.Kind, Path: srcDir, Reason: errExpectedFolderFoundFile}
 		}
 
 		if err := os.Rename(srcDir, dstDir); err != nil {
@@ -927,14 +1112,14 @@ func (f *NodeStore) RenameNode(entry *PageNode, newSlug string) error {
 		info, err := os.Stat(srcFile)
 		if err != nil {
 			if os.IsNotExist(err) {
-				return &DriftError{NodeID: entry.ID, Kind: entry.Kind, Path: srcFile, Reason: "expected file missing"}
+				return &DriftError{NodeID: entry.ID, Kind: entry.Kind, Path: srcFile, Reason: errExpectedFileMissing}
 			}
 			return fmt.Errorf("stat source file: %w", err)
 		}
 		if info.IsDir() {
 			// drift: tree says page but disk is a dir
 			f.log.Warn("drift: tree says page but disk is a dir", "srcFile", srcFile)
-			return &DriftError{NodeID: entry.ID, Kind: entry.Kind, Path: srcFile, Reason: "expected file but found folder"}
+			return &DriftError{NodeID: entry.ID, Kind: entry.Kind, Path: srcFile, Reason: errExpectedFileFoundFolder}
 		}
 
 		if err := os.Rename(srcFile, dstFile); err != nil {
@@ -943,7 +1128,7 @@ func (f *NodeStore) RenameNode(entry *PageNode, newSlug string) error {
 		return nil
 
 	default:
-		return &InvalidOpError{Op: "RenameNode", Reason: fmt.Sprintf("unknown node kind: %q", entry.Kind)}
+		return &InvalidOpError{Op: "RenameNode", Reason: fmt.Sprintf(errUnknownNodeKind, entry.Kind)}
 	}
 }
 
@@ -962,7 +1147,7 @@ func (f *NodeStore) ReadPageRaw(entry *PageNode) (string, error) {
 	} else {
 		// Pages must have a content file
 		if !fileExists(filePath) {
-			return "", &DriftError{NodeID: entry.ID, Kind: entry.Kind, Path: filePath, Reason: "expected page file missing"}
+			return "", &DriftError{NodeID: entry.ID, Kind: entry.Kind, Path: filePath, Reason: errExpectedPageMissing}
 		}
 	}
 
@@ -1017,7 +1202,7 @@ func (f *NodeStore) ReadPageContent(entry *PageNode) (string, error) {
 // SyncFrontmatterIfExists updates the frontmatter of a page file on disk if it exists
 func (f *NodeStore) SyncFrontmatterIfExists(entry *PageNode) error {
 	if entry == nil {
-		return &InvalidOpError{Op: "SyncFrontmatterIfExists", Reason: "an entry is required"}
+		return &InvalidOpError{Op: "SyncFrontmatterIfExists", Reason: errEntryRequired}
 	}
 
 	// keine side effects: write-path NICHT verwenden (würde mkdir + bei Section implizit index.md Pfad liefern)
@@ -1031,7 +1216,7 @@ func (f *NodeStore) SyncFrontmatterIfExists(entry *PageNode) error {
 	if !fileExists(filePath) {
 		// Page: muss existieren
 		if entry.Kind == NodeKindPage || entry.Kind == "" {
-			return &DriftError{NodeID: entry.ID, Kind: entry.Kind, Path: filePath, Reason: "expected page file missing"}
+			return &DriftError{NodeID: entry.ID, Kind: entry.Kind, Path: filePath, Reason: errExpectedPageMissing}
 		}
 		// Section: kein index.md -> NICHT erzeugen
 		return nil
@@ -1049,9 +1234,34 @@ func (f *NodeStore) SyncFrontmatterIfExists(entry *PageNode) error {
 	return nil
 }
 
+// getIgnoreForDir returns the compiled ignore rules for the given directory,
+// delegating to the shared cache. Returns nil if no rules apply.
+func (f *NodeStore) getIgnoreForDir(dir string) *ignore.IgnoreFile {
+	if f.ignoreCache == nil {
+		return nil
+	}
+	return f.ignoreCache.Get(dir)
+}
+
+// isPathIgnored checks if a relative path matches the ignore rules
+// governed by the nearest .leafwikiignore file.
+func (f *NodeStore) isPathIgnored(relPath string, isDir bool) bool {
+	if relPath == "" {
+		return false
+	}
+	// Resolve the absolute path to find the enclosing directory
+	absPath := filepath.Join(f.storageDir, "root", relPath)
+	dir := filepath.Dir(absPath)
+	ig := f.getIgnoreForDir(dir)
+	if ig == nil {
+		return false
+	}
+	return ig.Matches(filepath.ToSlash(relPath), isDir)
+}
+
 func (f *NodeStore) dirPathForNode(entry *PageNode) (string, error) {
 	if entry == nil {
-		return "", &InvalidOpError{Op: "dirPathForNode", Reason: "an entry is required"}
+		return "", &InvalidOpError{Op: "dirPathForNode", Reason: errEntryRequired}
 	}
 	return filepath.Join(f.storageDir, GeneratePathFromPageNode(entry)), nil
 }
@@ -1062,7 +1272,7 @@ func (f *NodeStore) dirPathForNode(entry *PageNode) (string, error) {
 // - section => <base>/index.md
 func (f *NodeStore) contentPathForNodeRead(entry *PageNode) (string, error) {
 	if entry == nil {
-		return "", &InvalidOpError{Op: "contentPathForNodeRead", Reason: "an entry is required"}
+		return "", &InvalidOpError{Op: "contentPathForNodeRead", Reason: errEntryRequired}
 	}
 
 	base, err := f.dirPathForNode(entry)
@@ -1071,11 +1281,11 @@ func (f *NodeStore) contentPathForNodeRead(entry *PageNode) (string, error) {
 	}
 	switch entry.Kind {
 	case NodeKindSection:
-		return filepath.Join(base, "index.md"), nil
+		return filepath.Join(base, indexFilename), nil
 	case NodeKindPage:
 		return base + ".md", nil
 	default:
-		return "", &InvalidOpError{Op: "contentPathForNodeRead", Reason: fmt.Sprintf("unknown node kind: %q", entry.Kind)}
+		return "", &InvalidOpError{Op: "contentPathForNodeRead", Reason: fmt.Sprintf(errUnknownNodeKind, entry.Kind)}
 	}
 }
 
@@ -1085,7 +1295,7 @@ func (f *NodeStore) contentPathForNodeRead(entry *PageNode) (string, error) {
 // - section => <base>/index.md (ensures directory exists)
 func (f *NodeStore) contentPathForNodeWrite(entry *PageNode) (string, error) {
 	if entry == nil {
-		return "", &InvalidOpError{Op: "contentPathForNodeWrite", Reason: "an entry is required"}
+		return "", &InvalidOpError{Op: "contentPathForNodeWrite", Reason: errEntryRequired}
 	}
 
 	base, err := f.dirPathForNode(entry)
@@ -1097,13 +1307,13 @@ func (f *NodeStore) contentPathForNodeWrite(entry *PageNode) (string, error) {
 		if err := os.MkdirAll(base, 0o755); err != nil {
 			return "", fmt.Errorf("could not ensure folder: %w", err)
 		}
-		return filepath.Join(base, "index.md"), nil
+		return filepath.Join(base, indexFilename), nil
 
 	case NodeKindPage:
 		return base + ".md", nil
 
 	default:
-		return "", &InvalidOpError{Op: "contentPathForNodeWrite", Reason: fmt.Sprintf("unknown node kind: %q", entry.Kind)}
+		return "", &InvalidOpError{Op: "contentPathForNodeWrite", Reason: fmt.Sprintf(errUnknownNodeKind, entry.Kind)}
 	}
 }
 
@@ -1129,7 +1339,7 @@ func (f *NodeStore) resolveNode(entry *PageNode) (*ResolvedNode, error) {
 
 	// 2) Folder?
 	if info, err := os.Stat(basePath); err == nil && info.IsDir() {
-		index := filepath.Join(basePath, "index.md")
+		index := filepath.Join(basePath, indexFilename)
 		if _, err := os.Stat(index); err == nil {
 			f.log.Debug("resolved as section node with content", "dirPath", basePath, "filePath", index)
 			return &ResolvedNode{
@@ -1155,7 +1365,7 @@ func (f *NodeStore) resolveNode(entry *PageNode) (*ResolvedNode, error) {
 // NOTE: TreeService must ensure folder->page is allowed (no children).
 func (f *NodeStore) ConvertNode(entry *PageNode, target NodeKind) error {
 	if entry == nil {
-		return &InvalidOpError{Op: "ConvertNode", Reason: "an entry is required"}
+		return &InvalidOpError{Op: "ConvertNode", Reason: errEntryRequired}
 	}
 
 	base, err := f.dirPathForNode(entry)
@@ -1164,7 +1374,7 @@ func (f *NodeStore) ConvertNode(entry *PageNode, target NodeKind) error {
 	}
 	filePath := base + ".md"
 	folderPath := base
-	indexPath := filepath.Join(folderPath, "index.md")
+	indexPath := filepath.Join(folderPath, indexFilename)
 
 	switch target {
 	case NodeKindSection:
@@ -1204,7 +1414,7 @@ func (f *NodeStore) ConvertNode(entry *PageNode, target NodeKind) error {
 			return err
 		}
 		if !info.IsDir() {
-			return &DriftError{NodeID: entry.ID, Kind: NodeKindSection, Path: folderPath, Reason: "expected folder but found file"}
+			return &DriftError{NodeID: entry.ID, Kind: NodeKindSection, Path: folderPath, Reason: errExpectedFolderFoundFile}
 		}
 
 		entries, err := os.ReadDir(folderPath)
@@ -1219,7 +1429,7 @@ func (f *NodeStore) ConvertNode(entry *PageNode, target NodeKind) error {
 		allowed := true
 		for _, e := range entries {
 			name := e.Name()
-			if name == "index.md" || name == orderFilename {
+			if name == indexFilename || name == orderFilename {
 				continue
 			}
 			allowed = false
@@ -1255,4 +1465,37 @@ func (f *NodeStore) ConvertNode(entry *PageNode, target NodeKind) error {
 	default:
 		return &InvalidOpError{Op: "ConvertNode", Reason: fmt.Sprintf("unknown target kind: %q", target)}
 	}
+}
+
+// SetPinnedFrontmatter updates the leafwiki_pinned flag in the page file on disk.
+// Returns the body content (without frontmatter) for use in the caller.
+func (f *NodeStore) SetPinnedFrontmatter(entry *PageNode, pinned bool) (string, error) {
+	if entry == nil {
+		return "", &InvalidOpError{Op: "SetPinnedFrontmatter", Reason: errEntryRequired}
+	}
+
+	filePath, err := f.contentPathForNodeRead(entry)
+	if err != nil {
+		return "", err
+	}
+
+	if !fileExists(filePath) {
+		if entry.Kind == NodeKindPage || entry.Kind == "" {
+			return "", &DriftError{NodeID: entry.ID, Kind: entry.Kind, Path: filePath, Reason: errExpectedPageMissing}
+		}
+		return "", &InvalidOpError{Op: "SetPinnedFrontmatter", Reason: "section has no index file and cannot be pinned"}
+	}
+
+	mdFile, err := markdown.LoadMarkdownFile(filePath)
+	if err != nil {
+		return "", fmt.Errorf("load markdown file: %w", err)
+	}
+
+	mdFile.SetLeafWikiPinned(pinned)
+
+	if err := mdFile.WriteToFile(); err != nil {
+		return "", fmt.Errorf("write markdown file: %w", err)
+	}
+
+	return mdFile.GetContent(), nil
 }

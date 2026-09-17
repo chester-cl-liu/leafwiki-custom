@@ -1,6 +1,7 @@
 import { Paperclip } from 'lucide-react'
 import clsx from 'clsx'
 import { createElement, HTMLAttributes, isValidElement, ReactNode } from 'react'
+import { useTranslation } from 'react-i18next'
 
 function containsLink(node: ReactNode): boolean {
   if (node == null || typeof node === 'boolean') return false
@@ -41,10 +42,11 @@ export default function Headline({
   ...props
 }: HeadlineProps) {
   void node
+  const { t } = useTranslation('viewer')
   const tagName = `h${level}` as keyof HTMLElementTagNameMap
   const shouldRenderAnchor = hasGeneratedId === 'true' && !!id
   const hasNestedLink = containsLink(children)
-  const sectionLinkLabel = 'Link to section'
+  const sectionLinkLabel = t('headline.linkToSection')
 
   return createElement(
     tagName,
@@ -64,7 +66,7 @@ export default function Headline({
             aria-label={sectionLinkLabel}
             title={sectionLinkLabel}
           >
-            <span>
+            <span className="headline-anchor__icon">
               <Paperclip size={18} />
             </span>
           </a>
@@ -72,7 +74,7 @@ export default function Headline({
       ) : (
         <a className="headline-anchor headline-anchor--full" href={`#${id}`}>
           {children}
-          <span>
+          <span className="headline-anchor__icon">
             <Paperclip size={18} />
           </span>
         </a>

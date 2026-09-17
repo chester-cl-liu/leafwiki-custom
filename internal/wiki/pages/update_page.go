@@ -3,22 +3,26 @@ package pages
 import (
 	"context"
 	"log/slog"
+	"time"
 
 	sharederrors "github.com/perber/wiki/internal/core/shared/errors"
 	"github.com/perber/wiki/internal/core/tree"
+	httpmetrics "github.com/perber/wiki/internal/http/metrics"
 	"github.com/perber/wiki/internal/wiki/pagesave"
 )
 
 // UpdatePageInput is the input for UpdatePageUseCase.
 type UpdatePageInput struct {
-	UserID     string
-	ID         string
-	Version    string
-	Title      string
-	Slug       string
-	Content    *string
-	Kind       *tree.NodeKind
-	FromImport bool
+	UserID              string
+	ID                  string
+	Version             string
+	Title               string
+	Slug                string
+	Content             *string
+	Kind                *tree.NodeKind
+	Tags                []string
+	Properties          map[string]string
+	PreserveFrontmatter bool
 }
 
 // UpdatePageOutput is the output of UpdatePageUseCase.
@@ -32,6 +36,7 @@ type UpdatePageUseCase struct {
 	slug         *tree.SlugService
 	orchestrator *pagesave.PageSaveOrchestrator
 	log          *slog.Logger
+	metrics      *httpmetrics.HTTPMetrics
 }
 
 // NewUpdatePageUseCase constructs an UpdatePageUseCase.
@@ -40,12 +45,18 @@ func NewUpdatePageUseCase(
 	s *tree.SlugService,
 	o *pagesave.PageSaveOrchestrator,
 	log *slog.Logger,
+	metrics *httpmetrics.HTTPMetrics,
 ) *UpdatePageUseCase {
-	return &UpdatePageUseCase{tree: t, slug: s, orchestrator: o, log: log}
+	return &UpdatePageUseCase{tree: t, slug: s, orchestrator: o, log: log, metrics: metrics}
 }
 
 // Execute validates, updates the node, and fires post-save side effects.
-func (uc *UpdatePageUseCase) Execute(_ context.Context, in UpdatePageInput) (*UpdatePageOutput, error) {
+func (uc *UpdatePageUseCase) Execute(_ context.Context, in UpdatePageInput) (out *UpdatePageOutput, err error) {
+	started := time.Now()
+	defer func() {
+		uc.metrics.ObservePageSaveWorkflow(string(pagesave.PageOperationUpdate), err, started)
+	}()
+
 	ve := sharederrors.NewValidationErrors()
 	if in.Title == "" {
 		ve.Add("title", "Title must not be empty")
@@ -78,7 +89,7 @@ func (uc *UpdatePageUseCase) Execute(_ context.Context, in UpdatePageInput) (*Up
 		}
 	}
 
-	if err = uc.tree.UpdateNode(in.UserID, in.ID, in.Title, in.Slug, in.Content, in.Version, in.FromImport); err != nil {
+	if err = uc.tree.UpdateNode(in.UserID, in.ID, in.Title, in.Slug, in.Content, in.Version, in.Tags, in.Properties, in.PreserveFrontmatter); err != nil {
 		return nil, err
 	}
 

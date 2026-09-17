@@ -1,9 +1,11 @@
 import { NODE_KIND_PAGE, type Page } from '@/lib/api/pages'
 import BaseDialog from '@/components/BaseDialog'
 import { FormInput } from '@/components/FormInput'
+import { Button } from '@/components/ui/button'
 import i18next from '@/lib/i18n'
 import { DIALOG_EDIT_PAGE_METADATA } from '@/lib/registries'
 import { useTreeStore } from '@/stores/tree'
+import { CalendarDays } from 'lucide-react'
 import { useCallback, useState } from 'react'
 import { SlugInputWithSuggestion } from './SlugInputWithSuggestion'
 
@@ -27,8 +29,14 @@ export function EditPageMetadataDialog({
   onChange,
 }: EditPageMetadataDialogProps) {
   const parentPath = useTreeStore((s) => s.getPathById(parentId) || '')
-  const itemLabel = itemKind === NODE_KIND_PAGE ? 'page' : 'section'
-  const itemLabelCapitalized = itemKind === NODE_KIND_PAGE ? 'Page' : 'Section'
+  const itemLabel =
+    itemKind === NODE_KIND_PAGE
+      ? i18next.t('common.page', { ns: 'page' })
+      : i18next.t('common.section', { ns: 'page' })
+  const itemLabelCapitalized =
+    itemKind === NODE_KIND_PAGE
+      ? i18next.t('common.pageCapitalized', { ns: 'page' })
+      : i18next.t('common.sectionCapitalized', { ns: 'page' })
 
   const [title, setTitle] = useState(propTitle)
   const [slug, setSlug] = useState(propSlug)
@@ -66,8 +74,14 @@ export function EditPageMetadataDialog({
   return (
     <BaseDialog
       dialogType={DIALOG_EDIT_PAGE_METADATA}
-      dialogTitle={`Edit ${itemLabel} metadata`}
-      dialogDescription={`Change metadata of the ${itemLabel}`}
+      dialogTitle={i18next.t('editPageMetadataDialog.dialogTitle', {
+        ns: 'editor',
+        item: itemLabel,
+      })}
+      dialogDescription={i18next.t('editPageMetadataDialog.dialogDescription', {
+        ns: 'editor',
+        item: itemLabel,
+      })}
       onClose={() => {
         resetForm()
         return true
@@ -100,18 +114,37 @@ export function EditPageMetadataDialog({
       testidPrefix="edit-page-metadata-dialog"
     >
       <div className="page-dialog__fields">
-        <FormInput
-          autoFocus
-          label={i18next.t('editPageMetadataDialog.titleLabel', {
-            ns: 'editor',
-          })}
-          value={title}
-          onChange={handleTitleChange}
-          placeholder={`${itemLabelCapitalized} title`}
-          error={fieldErrors.title}
-          testid="edit-page-metadata-dialog-title-input"
-          allowedHotkeys={DIALOG_INPUT_ALLOWED_HOTKEYS}
-        />
+        <div className="page-dialog__title-row">
+          <FormInput
+            autoFocus
+            label={i18next.t('editPageMetadataDialog.titleLabel', {
+              ns: 'editor',
+            })}
+            value={title}
+            onChange={handleTitleChange}
+            placeholder={i18next.t('editPageMetadataDialog.titlePlaceholder', {
+              ns: 'editor',
+              item: itemLabelCapitalized,
+            })}
+            error={fieldErrors.title}
+            testid="edit-page-metadata-dialog-title-input"
+            allowedHotkeys={DIALOG_INPUT_ALLOWED_HOTKEYS}
+          />
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon"
+            className="page-dialog__date-btn"
+            title={i18next.t('editPageMetadataDialog.dateTitleTooltip', {
+              ns: 'editor',
+            })}
+            onClick={() =>
+              handleTitleChange(new Date().toISOString().slice(0, 10))
+            }
+          >
+            <CalendarDays size={15} />
+          </Button>
+        </div>
 
         <SlugInputWithSuggestion
           title={title}

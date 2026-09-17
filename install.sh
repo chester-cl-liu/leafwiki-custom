@@ -222,7 +222,7 @@ else
         ENABLE_REVISION="true"
 
         while true; do
-            read -p "Would you specify a max revison number ? (default: $MAX_REVISION_HISTORY) : " RESPONSE_MAX_REVISION
+            read -p "Would you specify a max revision number? (default: $MAX_REVISION_HISTORY): " RESPONSE_MAX_REVISION
             if [[ -z "$RESPONSE_MAX_REVISION" ]]; then
                 break
             elif [[ "$RESPONSE_MAX_REVISION" =~ ^[0-9]+$ ]]; then
@@ -252,7 +252,7 @@ else
     echo "LEAFWIKI_HOST=\"$HOST\"" >> "$ENV_FILE_PATH"
     echo "LEAFWIKI_JWT_SECRET=\"$JWT_SECRET\"" >> "$ENV_FILE_PATH"
     echo "LEAFWIKI_ADMIN_PASSWORD=\"$ADMIN_PASSWORD\"" >> "$ENV_FILE_PATH"
-    echo "LEAFWIKI_ENABLE_REVISION=\"$ENABLE_VERSIONING\"" >> "$ENV_FILE_PATH"
+    echo "LEAFWIKI_ENABLE_REVISION=\"$ENABLE_REVISION\"" >> "$ENV_FILE_PATH"
     echo "LEAFWIKI_MAX_REVISION_HISTORY=\"$MAX_REVISION_HISTORY\"" >> "$ENV_FILE_PATH"
 
 fi

@@ -270,7 +270,7 @@ func createSimpleLinkedPages(t *testing.T, ts *tree.TreeService) (pageAID, pageB
 		t.Fatalf("GetPage a failed: %v", err)
 	}
 	contentA := "Link to B: [Go to B](/b)"
-	if err := ts.UpdateNode("system", aPage.ID, aPage.Title, aPage.Slug, &contentA, tree.VersionUnchecked, false); err != nil {
+	if err := ts.UpdateNode("system", aPage.ID, aPage.Title, aPage.Slug, &contentA, tree.VersionUnchecked, nil, nil, false); err != nil {
 		t.Fatalf("UpdatePage a failed: %v", err)
 	}
 
@@ -279,7 +279,7 @@ func createSimpleLinkedPages(t *testing.T, ts *tree.TreeService) (pageAID, pageB
 		t.Fatalf("GetPage b failed: %v", err)
 	}
 	contentB := "# Page B\nNo outgoing links."
-	if err := ts.UpdateNode("system", bPage.ID, bPage.Title, bPage.Slug, &contentB, tree.VersionUnchecked, false); err != nil {
+	if err := ts.UpdateNode("system", bPage.ID, bPage.Title, bPage.Slug, &contentB, tree.VersionUnchecked, nil, nil, false); err != nil {
 		t.Fatalf("UpdatePage b failed: %v", err)
 	}
 
@@ -328,7 +328,7 @@ func TestLinkService_IndexAllPages_ReplacesExistingLinks(t *testing.T) {
 		t.Fatalf("GetPage a failed: %v", err)
 	}
 	var noLinks = "No more links."
-	if err := ts.UpdateNode("system", aPage.ID, aPage.Title, aPage.Slug, &noLinks, tree.VersionUnchecked, false); err != nil {
+	if err := ts.UpdateNode("system", aPage.ID, aPage.Title, aPage.Slug, &noLinks, tree.VersionUnchecked, nil, nil, false); err != nil {
 		t.Fatalf("UpdatePage a failed: %v", err)
 	}
 
@@ -453,7 +453,7 @@ func TestLinkService_GetOutgoingLinksForPage_NoOutgoings(t *testing.T) {
 	}
 
 	var noLinks = "Just some text, no links."
-	if err := ts.UpdateNode("system", page.ID, page.Title, page.Slug, &noLinks, tree.VersionUnchecked, false); err != nil {
+	if err := ts.UpdateNode("system", page.ID, page.Title, page.Slug, &noLinks, tree.VersionUnchecked, nil, nil, false); err != nil {
 		t.Fatalf("UpdateNode lonely failed: %v", err)
 	}
 
@@ -495,7 +495,7 @@ func TestLinkService_IndexAllPages_IgnoresAssetLinksInOutgoingAndBrokenSets(t *t
 		t.Fatalf("GetPage a failed: %v", err)
 	}
 	contentA := "Asset: [Manual](/assets/abc/manual.pdf)\nPage: [Go](/b)"
-	if err := ts.UpdateNode("system", pageA.ID, pageA.Title, pageA.Slug, &contentA, tree.VersionUnchecked, false); err != nil {
+	if err := ts.UpdateNode("system", pageA.ID, pageA.Title, pageA.Slug, &contentA, tree.VersionUnchecked, nil, nil, false); err != nil {
 		t.Fatalf("UpdateNode a failed: %v", err)
 	}
 
@@ -618,7 +618,7 @@ func TestLinkService_LateCreatedTarget_BecomesResolvedAfterReindex(t *testing.T)
 		t.Fatalf("GetPage a failed: %v", err)
 	}
 	var linkToB = "Link to B: [Go](/b)"
-	if err := ts.UpdateNode("system", aPage.ID, aPage.Title, aPage.Slug, &linkToB, tree.VersionUnchecked, false); err != nil {
+	if err := ts.UpdateNode("system", aPage.ID, aPage.Title, aPage.Slug, &linkToB, tree.VersionUnchecked, nil, nil, false); err != nil {
 		t.Fatalf("UpdateNode a failed: %v", err)
 	}
 
@@ -654,7 +654,7 @@ func TestLinkService_LateCreatedTarget_BecomesResolvedAfterReindex(t *testing.T)
 		t.Fatalf("GetPage b failed: %v", err)
 	}
 	var pageBContent = "# Page B"
-	if err := ts.UpdateNode("system", bPage.ID, bPage.Title, bPage.Slug, &pageBContent, tree.VersionUnchecked, false); err != nil {
+	if err := ts.UpdateNode("system", bPage.ID, bPage.Title, bPage.Slug, &pageBContent, tree.VersionUnchecked, nil, nil, false); err != nil {
 		t.Fatalf("UpdateNode b failed: %v", err)
 	}
 
@@ -705,7 +705,7 @@ func TestLinkService_HealOnPageCreate_ResolvesBrokenLinksWithoutReindex(t *testi
 		t.Fatalf("GetPage A failed: %v", err)
 	}
 	var linkToB = "Link to B: [Go](/b)"
-	if err := ts.UpdateNode("system", pageA.ID, pageA.Title, pageA.Slug, &linkToB, tree.VersionUnchecked, false); err != nil {
+	if err := ts.UpdateNode("system", pageA.ID, pageA.Title, pageA.Slug, &linkToB, tree.VersionUnchecked, nil, nil, false); err != nil {
 		t.Fatalf("UpdateNode A failed: %v", err)
 	}
 
@@ -804,7 +804,7 @@ func TestLinksStore_GetBrokenIncomingForPath_ReturnsBrokenLinks(t *testing.T) {
 		t.Fatalf("GetPage A failed: %v", err)
 	}
 	var linkToMissing = "Link: [Missing](/nonexistent)"
-	if err := ts.UpdateNode("system", pageA.ID, pageA.Title, pageA.Slug, &linkToMissing, tree.VersionUnchecked, false); err != nil {
+	if err := ts.UpdateNode("system", pageA.ID, pageA.Title, pageA.Slug, &linkToMissing, tree.VersionUnchecked, nil, nil, false); err != nil {
 		t.Fatalf("UpdateNode A failed: %v", err)
 	}
 
@@ -812,7 +812,7 @@ func TestLinksStore_GetBrokenIncomingForPath_ReturnsBrokenLinks(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetPage B failed: %v", err)
 	}
-	if err := ts.UpdateNode("system", pageB.ID, pageB.Title, pageB.Slug, &linkToMissing, tree.VersionUnchecked, false); err != nil {
+	if err := ts.UpdateNode("system", pageB.ID, pageB.Title, pageB.Slug, &linkToMissing, tree.VersionUnchecked, nil, nil, false); err != nil {
 		t.Fatalf("UpdateNode B failed: %v", err)
 	}
 
@@ -822,7 +822,7 @@ func TestLinksStore_GetBrokenIncomingForPath_ReturnsBrokenLinks(t *testing.T) {
 		t.Fatalf("GetPage C failed: %v", err)
 	}
 	var linkToOther = "Link: [Other](/other-missing)"
-	if err := ts.UpdateNode("system", pageC.ID, pageC.Title, pageC.Slug, &linkToOther, tree.VersionUnchecked, false); err != nil {
+	if err := ts.UpdateNode("system", pageC.ID, pageC.Title, pageC.Slug, &linkToOther, tree.VersionUnchecked, nil, nil, false); err != nil {
 		t.Fatalf("UpdateNode C failed: %v", err)
 	}
 
@@ -867,6 +867,56 @@ func TestLinksStore_GetBrokenIncomingForPath_ReturnsBrokenLinks(t *testing.T) {
 	}
 }
 
+func TestLinkService_GetBrokenLinks_ReturnsBrokenLinksWithResolvedFromPath(t *testing.T) {
+	svc, ts, _ := setupLinkService(t)
+
+	sectionIDPtr, err := ts.CreateNode("system", nil, "Docs", "docs", pageNodeKind())
+	if err != nil {
+		t.Fatalf("CreateNode docs failed: %v", err)
+	}
+	// Creating a child under "docs" auto-converts it to a section.
+	aIDPtr, err := ts.CreateNode("system", sectionIDPtr, "Page A", "a", pageNodeKind())
+	if err != nil {
+		t.Fatalf("CreateNode A failed: %v", err)
+	}
+	pageAID := *aIDPtr
+
+	pageA, err := ts.GetPage(pageAID)
+	if err != nil {
+		t.Fatalf("GetPage A failed: %v", err)
+	}
+	linkToMissing := "Link: [Missing](/nonexistent)"
+	if err := ts.UpdateNode("system", pageA.ID, pageA.Title, pageA.Slug, &linkToMissing, tree.VersionUnchecked, nil, nil, false); err != nil {
+		t.Fatalf("UpdateNode A failed: %v", err)
+	}
+
+	if err := svc.IndexAllPages(); err != nil {
+		t.Fatalf("IndexAllPages failed: %v", err)
+	}
+
+	broken, err := svc.GetBrokenLinks()
+	if err != nil {
+		t.Fatalf("GetBrokenLinks failed: %v", err)
+	}
+
+	if len(broken) != 1 {
+		t.Fatalf("expected 1 broken link, got %d: %+v", len(broken), broken)
+	}
+	got := broken[0]
+	if got.FromPageID != pageAID {
+		t.Errorf("FromPageID = %q, want %q", got.FromPageID, pageAID)
+	}
+	if got.FromPath != "/docs/a" {
+		t.Errorf("FromPath = %q, want %q", got.FromPath, "/docs/a")
+	}
+	if got.FromTitle != "Page A" {
+		t.Errorf("FromTitle = %q, want %q", got.FromTitle, "Page A")
+	}
+	if got.ToPath != "/nonexistent" {
+		t.Errorf("ToPath = %q, want %q", got.ToPath, "/nonexistent")
+	}
+}
+
 func TestLinksStore_GetBrokenIncomingForPath_FiltersByPath(t *testing.T) {
 	svc, ts, store := setupLinkService(t)
 
@@ -888,7 +938,7 @@ func TestLinksStore_GetBrokenIncomingForPath_FiltersByPath(t *testing.T) {
 		t.Fatalf("GetPage A failed: %v", err)
 	}
 	var linkToMissing1 = "Link: [Missing1](/missing1)"
-	if err := ts.UpdateNode("system", pageA.ID, pageA.Title, pageA.Slug, &linkToMissing1, tree.VersionUnchecked, false); err != nil {
+	if err := ts.UpdateNode("system", pageA.ID, pageA.Title, pageA.Slug, &linkToMissing1, tree.VersionUnchecked, nil, nil, false); err != nil {
 		t.Fatalf("UpdateNode A failed: %v", err)
 	}
 
@@ -898,7 +948,7 @@ func TestLinksStore_GetBrokenIncomingForPath_FiltersByPath(t *testing.T) {
 		t.Fatalf("GetPage B failed: %v", err)
 	}
 	var linkToMissing2 = "Link: [Missing2](/missing2)"
-	if err := ts.UpdateNode("system", pageB.ID, pageB.Title, pageB.Slug, &linkToMissing2, tree.VersionUnchecked, false); err != nil {
+	if err := ts.UpdateNode("system", pageB.ID, pageB.Title, pageB.Slug, &linkToMissing2, tree.VersionUnchecked, nil, nil, false); err != nil {
 		t.Fatalf("UpdateNode B failed: %v", err)
 	}
 
@@ -953,7 +1003,7 @@ func TestLinksStore_GetBrokenIncomingForPath_EmptyWhenNoBrokenLinks(t *testing.T
 		t.Fatalf("GetPage A failed: %v", err)
 	}
 	var linkToB = "Link: [To B](/b)"
-	if err := ts.UpdateNode("system", pageA.ID, pageA.Title, pageA.Slug, &linkToB, tree.VersionUnchecked, false); err != nil {
+	if err := ts.UpdateNode("system", pageA.ID, pageA.Title, pageA.Slug, &linkToB, tree.VersionUnchecked, nil, nil, false); err != nil {
 		t.Fatalf("UpdateNode A failed: %v", err)
 	}
 
@@ -1009,7 +1059,7 @@ func TestLinksStore_GetBrokenIncomingForPath_OrdersByFromTitle(t *testing.T) {
 			t.Fatalf("GetPage(%s) failed: %v", id, err)
 		}
 		var linkToMissing = "Link: [Missing](/missing)"
-		if err := ts.UpdateNode("system", page.ID, page.Title, page.Slug, &linkToMissing, tree.VersionUnchecked, false); err != nil {
+		if err := ts.UpdateNode("system", page.ID, page.Title, page.Slug, &linkToMissing, tree.VersionUnchecked, nil, nil, false); err != nil {
 			t.Fatalf("UpdateNode(%s) failed: %v", id, err)
 		}
 	}
@@ -1052,7 +1102,7 @@ func TestLinksStore_GetBrokenIncomingForPath_OnlyReturnsBrokenNotResolved(t *tes
 		t.Fatalf("GetPage A failed: %v", err)
 	}
 	var linkToB = "Link: [To B](/b)"
-	if err := ts.UpdateNode("system", pageA.ID, pageA.Title, pageA.Slug, &linkToB, tree.VersionUnchecked, false); err != nil {
+	if err := ts.UpdateNode("system", pageA.ID, pageA.Title, pageA.Slug, &linkToB, tree.VersionUnchecked, nil, nil, false); err != nil {
 		t.Fatalf("UpdateNode A failed: %v", err)
 	}
 
@@ -1082,7 +1132,7 @@ func TestLinksStore_GetBrokenIncomingForPath_OnlyReturnsBrokenNotResolved(t *tes
 		t.Fatalf("GetPage B failed: %v", err)
 	}
 	var contentB = "# Page B"
-	if err := ts.UpdateNode("system", pageB.ID, pageB.Title, pageB.Slug, &contentB, tree.VersionUnchecked, false); err != nil {
+	if err := ts.UpdateNode("system", pageB.ID, pageB.Title, pageB.Slug, &contentB, tree.VersionUnchecked, nil, nil, false); err != nil {
 		t.Fatalf("UpdateNode B failed: %v", err)
 	}
 
@@ -1133,7 +1183,7 @@ func TestLinkService_UpdateLinksAndHealForPages_UpdatesAndHealsMultiplePages(t *
 		t.Fatalf("GetPage A failed: %v", err)
 	}
 	contentA := "Link: [B](/b)"
-	if err := ts.UpdateNode("system", pageA.ID, pageA.Title, pageA.Slug, &contentA, tree.VersionUnchecked, false); err != nil {
+	if err := ts.UpdateNode("system", pageA.ID, pageA.Title, pageA.Slug, &contentA, tree.VersionUnchecked, nil, nil, false); err != nil {
 		t.Fatalf("UpdateNode A failed: %v", err)
 	}
 
@@ -1142,7 +1192,7 @@ func TestLinkService_UpdateLinksAndHealForPages_UpdatesAndHealsMultiplePages(t *
 		t.Fatalf("GetPage C failed: %v", err)
 	}
 	contentC := "Link: [D](/d)"
-	if err := ts.UpdateNode("system", pageC.ID, pageC.Title, pageC.Slug, &contentC, tree.VersionUnchecked, false); err != nil {
+	if err := ts.UpdateNode("system", pageC.ID, pageC.Title, pageC.Slug, &contentC, tree.VersionUnchecked, nil, nil, false); err != nil {
 		t.Fatalf("UpdateNode C failed: %v", err)
 	}
 
@@ -1221,7 +1271,7 @@ func TestLinkService_UpdateLinksAndHealForPages_ReindexesOutgoingForSourcePages(
 		t.Fatalf("GetPage source failed: %v", err)
 	}
 	oldContent := "Link: [Old](/old-target)"
-	if err := ts.UpdateNode("system", source.ID, source.Title, source.Slug, &oldContent, tree.VersionUnchecked, false); err != nil {
+	if err := ts.UpdateNode("system", source.ID, source.Title, source.Slug, &oldContent, tree.VersionUnchecked, nil, nil, false); err != nil {
 		t.Fatalf("UpdateNode source failed: %v", err)
 	}
 
@@ -1236,7 +1286,7 @@ func TestLinkService_UpdateLinksAndHealForPages_ReindexesOutgoingForSourcePages(
 	newTargetID := *newTargetIDPtr
 
 	updatedContent := "Link: [New](/new-target)"
-	if err := ts.UpdateNode("system", source.ID, source.Title, source.Slug, &updatedContent, tree.VersionUnchecked, false); err != nil {
+	if err := ts.UpdateNode("system", source.ID, source.Title, source.Slug, &updatedContent, tree.VersionUnchecked, nil, nil, false); err != nil {
 		t.Fatalf("UpdateNode source (rewrite) failed: %v", err)
 	}
 
@@ -1298,6 +1348,54 @@ func TestExtractWikiLinksFromMarkdown_DeduplicatesTargets(t *testing.T) {
 	}
 	if got[0] != "Notes" {
 		t.Errorf("got %q, want %q", got[0], "Notes")
+	}
+}
+
+func TestExtractWikiLinksFromMarkdown_IgnoresFencedCodeBlock(t *testing.T) {
+	md := "```bash\nif [[ -n \"$computed_hash\" && -n \"$src_hash\" ]]; then\n  [[ \"$src_hash\" == sha256-* ]]\nfi\n```\n"
+
+	got := extractWikiLinksFromMarkdown(md)
+	if len(got) != 0 {
+		t.Fatalf("expected no wiki links from fenced code block, got %v", got)
+	}
+}
+
+func TestExtractWikiLinksFromMarkdown_IgnoresInlineCode(t *testing.T) {
+	got := extractWikiLinksFromMarkdown("`[[ -n $x ]]`")
+	if len(got) != 0 {
+		t.Fatalf("expected no wiki links from inline code, got %v", got)
+	}
+}
+
+func TestExtractWikiLinksFromMarkdown_MixedRealAndCodeBlock(t *testing.T) {
+	md := "See [[Real Page]].\n\n```\n[[ -z \"$x\" ]]\n```\n"
+
+	got := extractWikiLinksFromMarkdown(md)
+	if len(got) != 1 {
+		t.Fatalf("expected 1 wiki link, got %d: %v", len(got), got)
+	}
+	if got[0] != "Real Page" {
+		t.Errorf("got %q, want %q", got[0], "Real Page")
+	}
+}
+
+func TestExtractWikiLinksFromMarkdown_IgnoresIndentedCodeBlock(t *testing.T) {
+	got := extractWikiLinksFromMarkdown("    [[ Something ]]\n")
+	if len(got) != 0 {
+		t.Fatalf("expected no wiki links from indented code block, got %v", got)
+	}
+}
+
+func TestExtractWikiLinksFromMarkdown_IgnoresBashConditionalsOutsideCodeBlocks(t *testing.T) {
+	cases := []string{
+		`if [[ -n "$computed_hash" && -n "$src_hash" ]]; then`,
+		`if [[ "$src_hash" == sha256-* ]]; then`,
+	}
+	for _, content := range cases {
+		got := extractWikiLinksFromMarkdown(content)
+		if len(got) != 0 {
+			t.Errorf("input %q: expected no wiki links, got %v", content, got)
+		}
 	}
 }
 
@@ -1420,8 +1518,8 @@ func TestResolveWikiLinkTargets_SlashTitleFallback(t *testing.T) {
 		t.Fatalf("CreateNode: %v", err)
 	}
 
-	// "C/C++ Guide" contains "/" so it tries path lookup first,
-	// then falls back to title lookup.
+	// "C/C++ Guide" contains "/" but is tried as a title first and resolves
+	// directly — no colliding route path exists in this tree.
 	targets := resolveWikiLinkTargets(ts, []string{"C/C++ Guide"})
 	if len(targets) != 1 {
 		t.Fatalf("expected 1 result, got %d", len(targets))
@@ -1431,6 +1529,76 @@ func TestResolveWikiLinkTargets_SlashTitleFallback(t *testing.T) {
 	}
 	if targets[0].TargetPageID != *idPtr {
 		t.Errorf("TargetPageID = %q, want %q", targets[0].TargetPageID, *idPtr)
+	}
+}
+
+// TestResolveWikiLinkTargets_SlashTitle_PrefersTitleOverCollidingRoutePath is
+// the regression test for "WikiLinks Break When the Target Title Contains a
+// Slash": a page titled "TCP/IP" must resolve to itself even when an
+// unrelated route path "tcp/ip" also exists in the tree — before the fix,
+// the route-path lookup was tried first and silently won, resolving the
+// link to the wrong page with Broken staying false.
+func TestResolveWikiLinkTargets_SlashTitle_PrefersTitleOverCollidingRoutePath(t *testing.T) {
+	storageDir := t.TempDir()
+	ts := tree.NewTreeService(storageDir)
+	if err := ts.LoadTree(); err != nil {
+		t.Fatalf("LoadTree: %v", err)
+	}
+
+	// A section slugged "TCP" with a child slugged "IP" — a colliding route
+	// path "TCP/IP" for the unrelated target string "TCP/IP". Slug matching
+	// is case-sensitive (findChildBySlugExactInParentLocked), so the slugs
+	// must match the target's exact casing for the collision to be real.
+	sectionID, err := ts.CreateNode("system", nil, "TCP Docs", "TCP", pageNodeKind())
+	if err != nil {
+		t.Fatalf("CreateNode section: %v", err)
+	}
+	_, err = ts.CreateNode("system", sectionID, "IP Notes", "IP", pageNodeKind())
+	if err != nil {
+		t.Fatalf("CreateNode child: %v", err)
+	}
+
+	// The actually-titled page "TCP/IP", unrelated to the section above.
+	titledIDPtr, err := ts.CreateNode("system", nil, "TCP/IP", "tcp-ip-guide", pageNodeKind())
+	if err != nil {
+		t.Fatalf("CreateNode titled page: %v", err)
+	}
+
+	targets := resolveWikiLinkTargets(ts, []string{"TCP/IP"})
+	if len(targets) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(targets))
+	}
+	if targets[0].Broken {
+		t.Fatalf("expected resolved link to the titled page, got broken")
+	}
+	if targets[0].TargetPageID != *titledIDPtr {
+		t.Errorf("TargetPageID = %q, want %q (the titled page, not the colliding slug path)", targets[0].TargetPageID, *titledIDPtr)
+	}
+	want := wikilinkSentinel("TCP/IP")
+	if targets[0].TargetPagePath != want {
+		t.Errorf("TargetPagePath = %q, want %q", targets[0].TargetPagePath, want)
+	}
+}
+
+func TestResolveWikiLinkTargets_AmbiguousSlashTitle_ReturnsBroken(t *testing.T) {
+	storageDir := t.TempDir()
+	ts := tree.NewTreeService(storageDir)
+	if err := ts.LoadTree(); err != nil {
+		t.Fatalf("LoadTree: %v", err)
+	}
+	if _, err := ts.CreateNode("system", nil, "TCP/IP", "tcp-ip-a", pageNodeKind()); err != nil {
+		t.Fatalf("CreateNode a: %v", err)
+	}
+	if _, err := ts.CreateNode("system", nil, "TCP/IP", "tcp-ip-b", pageNodeKind()); err != nil {
+		t.Fatalf("CreateNode b: %v", err)
+	}
+
+	targets := resolveWikiLinkTargets(ts, []string{"TCP/IP"})
+	if len(targets) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(targets))
+	}
+	if !targets[0].Broken {
+		t.Errorf("expected broken link for ambiguous slash-title match")
 	}
 }
 

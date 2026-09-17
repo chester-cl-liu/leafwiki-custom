@@ -3,12 +3,15 @@ package importer
 import (
 	"archive/zip"
 	"fmt"
-	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/perber/wiki/internal/core/shared"
 )
+
+const logCloseFailed = "close failed"
 
 type ZipExtractor struct {
 	log *slog.Logger
@@ -25,13 +28,17 @@ func (x *ZipExtractor) ExtractToTemp(zipPath string) (*ZipWorkspace, error) {
 }
 
 func (x *ZipExtractor) ExtractToDir(zipPath string, baseDir string) (*ZipWorkspace, error) {
+	return x.extractToDirWithLimits(zipPath, baseDir, shared.DefaultZipExtractionLimits)
+}
+
+func (x *ZipExtractor) extractToDirWithLimits(zipPath string, baseDir string, limits shared.ExtractionLimits) (*ZipWorkspace, error) {
 	r, err := zip.OpenReader(zipPath)
 	if err != nil {
 		return nil, fmt.Errorf("open zip: %w", err)
 	}
 	defer func() {
 		if err := r.Close(); err != nil {
-			x.log.Error("close failed", "error", err)
+			x.log.Error(logCloseFailed, "error", err)
 		}
 	}()
 
@@ -56,6 +63,7 @@ func (x *ZipExtractor) ExtractToDir(zipPath string, baseDir string) (*ZipWorkspa
 		return nil, e
 	}
 
+	budget := shared.NewSizeBudget(limits.MaxTotalBytes)
 	for _, f := range r.File {
 		name := strings.TrimSpace(f.Name)
 		if name == "" {
@@ -82,7 +90,7 @@ func (x *ZipExtractor) ExtractToDir(zipPath string, baseDir string) (*ZipWorkspa
 			}
 			defer func() {
 				if err := rc.Close(); err != nil {
-					x.log.Error("close failed", "error", err)
+					x.log.Error(logCloseFailed, "error", err)
 				}
 			}()
 
@@ -92,11 +100,11 @@ func (x *ZipExtractor) ExtractToDir(zipPath string, baseDir string) (*ZipWorkspa
 			}
 			defer func() {
 				if err := out.Close(); err != nil {
-					x.log.Error("close failed", "error", err)
+					x.log.Error(logCloseFailed, "error", err)
 				}
 			}()
 
-			if _, err := io.Copy(out, rc); err != nil {
+			if err := shared.CopyWithBudget(out, rc, f.CompressedSize64, limits, budget); err != nil {
 				return fmt.Errorf("write file: %w", err)
 			}
 

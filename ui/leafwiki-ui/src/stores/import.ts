@@ -1,9 +1,14 @@
 import * as importAPI from '@/lib/api/import'
 import { ApiError } from '@/lib/api/auth'
 import { mapApiError } from '@/lib/api/errors'
+import i18next from '@/lib/i18n'
+import { sleep } from '@/lib/sleep'
 import { toast } from 'sonner'
 import { create } from 'zustand'
 import { useTreeStore } from './tree'
+
+const t = (key: string, opts?: Record<string, unknown>) =>
+  i18next.t(key, { ...opts, ns: 'importer' })
 
 type ImportStore = {
   creatingImportPlan: boolean
@@ -20,10 +25,6 @@ type ImportStore = {
 
 const IMPORT_POLL_INTERVAL_MS = 1000
 const IMPORT_POLL_RETRY_LIMIT = 3
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => window.setTimeout(resolve, ms))
-}
 
 async function pollImportPlanUntilSettled(
   initialPlan: importAPI.ImportPlan,
@@ -64,11 +65,11 @@ export const useImportStore = create<ImportStore>((set, get) => ({
     set({ creatingImportPlan: true })
     try {
       const importPlan = await importAPI.createImportPlanFromZip(sourcePath)
-      toast.success('Import plan created successfully')
+      toast.success(t('toast.planCreatedSuccess'))
       set({ importPlan, importResult: null })
       return true
     } catch (err) {
-      toast.error(mapApiError(err, 'Failed to create import plan').message)
+      toast.error(mapApiError(err, t('toast.createPlanErrorFallback')).message)
       return false
     } finally {
       set({ creatingImportPlan: false })
@@ -92,7 +93,7 @@ export const useImportStore = create<ImportStore>((set, get) => ({
         })
       }
     } catch (err) {
-      const mapped = mapApiError(err, 'Failed to load import plan')
+      const mapped = mapApiError(err, t('toast.loadPlanErrorFallback'))
       if (
         (err instanceof ApiError && err.status === 404) ||
         mapped.code === 'importer_no_plan'
@@ -109,7 +110,7 @@ export const useImportStore = create<ImportStore>((set, get) => ({
   executeImportPlan: async () => {
     const importPlan = get().importPlan
     if (importPlan === null) {
-      toast.error('No import plan to execute')
+      toast.error(t('toast.noPlanToExecute'))
       return
     }
     try {
@@ -120,13 +121,13 @@ export const useImportStore = create<ImportStore>((set, get) => ({
       currentPlan = await pollImportPlanUntilSettled(currentPlan, set)
 
       if (currentPlan.execution_status === 'completed') {
-        toast.success('Import completed successfully')
+        toast.success(t('toast.executeSuccess'))
         set({
           importPlan: currentPlan,
           importResult: currentPlan.execution_result ?? null,
         })
       } else if (currentPlan.execution_status === 'canceled') {
-        toast.success('Import canceled')
+        toast.success(t('toast.canceledSuccess'))
         set({
           importPlan: currentPlan,
           importResult: currentPlan.execution_result ?? null,
@@ -134,11 +135,11 @@ export const useImportStore = create<ImportStore>((set, get) => ({
       } else if (currentPlan.execution_status === 'failed') {
         set({ importPlan: currentPlan })
         throw new Error(
-          currentPlan.execution_error || 'Import execution failed',
+          currentPlan.execution_error || t('toast.executionFailedFallback'),
         )
       }
     } catch (err) {
-      toast.error(mapApiError(err, 'Failed to execute import plan').message)
+      toast.error(mapApiError(err, t('toast.executeErrorFallback')).message)
     } finally {
       set({ executingImportPlan: false })
       // reload tree
@@ -148,7 +149,7 @@ export const useImportStore = create<ImportStore>((set, get) => ({
   cancelImportPlan: async () => {
     const importPlan = get().importPlan
     if (importPlan === null) {
-      toast.error('No import plan to clear')
+      toast.error(t('toast.noPlanToClear'))
       return false
     }
     try {
@@ -164,8 +165,8 @@ export const useImportStore = create<ImportStore>((set, get) => ({
         const finalPlan = await pollImportPlanUntilSettled(response, set)
         toast.success(
           finalPlan.execution_status === 'canceled'
-            ? 'Import canceled'
-            : 'Import finished before cancellation completed',
+            ? t('toast.canceledSuccess')
+            : t('toast.canceledBeforeCompletion'),
         )
         set({
           importPlan: finalPlan,
@@ -175,12 +176,12 @@ export const useImportStore = create<ImportStore>((set, get) => ({
         return finalPlan.execution_status === 'canceled'
       }
 
-      toast.success('Import plan cleared')
+      toast.success(t('toast.planClearedSuccess'))
       set({ importPlan: null, importResult: null })
       return true
     } catch (err) {
       toast.error(
-        mapApiError(err, 'Failed to cancel or clear import plan').message,
+        mapApiError(err, t('toast.cancelOrClearErrorFallback')).message,
       )
       return false
     } finally {

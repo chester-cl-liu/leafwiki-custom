@@ -57,8 +57,7 @@ export function HotKeyHandler() {
       }
 
       const registeredKeys = registeredHotkeys[comboString] as
-        | HotKeyDefinition[]
-        | undefined
+        HotKeyDefinition[] | undefined
 
       if (!registeredKeys || registeredKeys.length === 0) {
         return
@@ -84,9 +83,12 @@ export function HotKeyHandler() {
   )
 
   useEffect(() => {
-    window.addEventListener('keydown', onKeyDown)
+    // Capture phase so we can preventDefault before the browser handles the
+    // same combo (e.g. Ctrl+Alt+P opening print / private-window shortcuts).
+    // See https://github.com/perber/leafwiki/issues/1314
+    window.addEventListener('keydown', onKeyDown, true)
     return () => {
-      window.removeEventListener('keydown', onKeyDown)
+      window.removeEventListener('keydown', onKeyDown, true)
     }
   }, [onKeyDown])
 

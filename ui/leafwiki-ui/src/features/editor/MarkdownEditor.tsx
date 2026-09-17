@@ -7,16 +7,22 @@ import {
   ClipboardEvent,
   forwardRef,
   JSX,
+  MouseEvent as ReactMouseEvent,
   useCallback,
   useEffect,
   useImperativeHandle,
   useRef,
   useState,
 } from 'react'
+import { useTranslation } from 'react-i18next'
 import MarkdownPreview from '../preview/MarkdownPreview'
 import MarkdownCodeEditor from './MarkdownCodeEditor'
 import MarkdownToolbar from './MarkdownToolbar'
-import { insertHeadingAtStart, insertWrappedText } from './editorCommands'
+import {
+  insertHeadingAtStart,
+  insertWrappedText,
+  replaceFilenameInText,
+} from './editorCommands'
 
 import { uploadAsset, UploadAssetResponse } from '@/lib/api/assets'
 import { mapApiError } from '@/lib/api/errors'
@@ -26,6 +32,8 @@ import { useEditorStore } from '@/stores/editor'
 import { toast } from 'sonner'
 import { usePageEditorStore } from './pageEditorStore'
 import { slugifyHeadline } from '../preview/rehypeLineNumber'
+import { htmlToMarkdown } from './htmlToMarkdown'
+import { uploadInlineDataUriImages } from './pasteImageUpload'
 
 export type MarkdownEditorRef = {
   insertAtCursor: (text: string) => void
@@ -40,12 +48,34 @@ export type MarkdownEditorRef = {
   redo: () => void
   canUndo: () => boolean
   canRedo: () => boolean
+  pasteRich: () => Promise<void>
+  pastePlain: () => Promise<void>
 }
 
 type Props = {
   initialValue?: string
   onChange: (newValue: string) => void
   pageId: string
+}
+
+const DEFAULT_EDITOR_PANE_WIDTH = 50
+const MIN_EDITOR_PANE_WIDTH = 25
+const MAX_EDITOR_PANE_WIDTH = 75
+const EDITOR_PANE_WIDTH_STORAGE_KEY = 'leafwiki-editor-pane-width'
+
+function clampEditorPaneWidth(value: number) {
+  return Math.min(MAX_EDITOR_PANE_WIDTH, Math.max(MIN_EDITOR_PANE_WIDTH, value))
+}
+
+function getInitialEditorPaneWidth() {
+  if (typeof window === 'undefined') return DEFAULT_EDITOR_PANE_WIDTH
+
+  const storedValue = window.localStorage.getItem(EDITOR_PANE_WIDTH_STORAGE_KEY)
+  const parsed = Number.parseFloat(storedValue ?? '')
+
+  if (Number.isNaN(parsed)) return DEFAULT_EDITOR_PANE_WIDTH
+
+  return clampEditorPaneWidth(parsed)
 }
 
 const MarkdownEditor = (
@@ -77,7 +107,9 @@ const MarkdownEditor = (
     [],
   )
 
+  const { t } = useTranslation('editor')
   const previewRef = useRef<HTMLDivElement | null>(null)
+  const desktopSplitRef = useRef<HTMLDivElement | null>(null)
 
   const setPreviewRef = useCallback((node: HTMLDivElement | null) => {
     if (node) {
@@ -88,9 +120,18 @@ const MarkdownEditor = (
   const editorViewRef = useRef<EditorView | null>(null)
   const rafRef = useRef<number | null>(null)
   const currentCursorLineRef = useRef<number | null>(null)
+  const liveEditorPaneWidthRef = useRef(DEFAULT_EDITOR_PANE_WIDTH)
+  const resizeHandlersRef = useRef<{
+    onMouseMove: (event: MouseEvent) => void
+    onMouseUp: () => void
+  } | null>(null)
   const [assetVersion, setAssetVersion] = useState(() => Date.now()) // Initial version based on current timestamp
 
   const [markdown, setMarkdown] = useState(initialValue)
+  const [editorPaneWidth, setEditorPaneWidth] = useState(
+    getInitialEditorPaneWidth,
+  )
+  const [isResizingSplit, setIsResizingSplit] = useState(false)
   const debouncedPreview = useDebounce(markdown, 100)
   const isMobile = useIsMobile()
   const maxAssetUploadSizeBytes = useConfigStore(
@@ -99,11 +140,25 @@ const MarkdownEditor = (
 
   const {
     previewVisible: showPreview,
+    previewStacked,
     togglePreview,
+    togglePreviewLayout,
     lineWrap,
   } = useEditorStore()
 
   const [activeTab, setActiveTab] = useState<'editor' | 'preview'>('editor')
+
+  useEffect(() => {
+    liveEditorPaneWidthRef.current = editorPaneWidth
+  }, [editorPaneWidth])
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    window.localStorage.setItem(
+      EDITOR_PANE_WIDTH_STORAGE_KEY,
+      String(editorPaneWidth),
+    )
+  }, [editorPaneWidth])
 
   // Handles paste requests.
   // This allows to paste images from clipboard directly into the editor.
@@ -139,7 +194,9 @@ const MarkdownEditor = (
       for (const file of files) {
         if (file.size > maxAssetUploadSizeBytes) {
           toast.error(
-            `File too large. Max ${formatBytes(maxAssetUploadSizeBytes)} allowed.`,
+            t('markdownEditor.fileTooLarge', {
+              maxSize: formatBytes(maxAssetUploadSizeBytes),
+            }),
           )
           continue
         }
@@ -148,7 +205,9 @@ const MarkdownEditor = (
         try {
           const res: UploadAssetResponse = await uploadAsset(pageId, file)
 
-          toast.success(`Uploaded ${file.name}`)
+          toast.success(
+            t('markdownEditor.uploadedToast', { filename: file.name }),
+          )
 
           // The result of uploadAsset looks like this:
           // {"file":"/assets/0NmpvSivg/preview-scrollbar.gif"}
@@ -177,17 +236,20 @@ const MarkdownEditor = (
           editorViewRef.current?.focus()
         } catch (err) {
           console.error('Upload failed', err)
-          toast.error(mapApiError(err, `Failed to upload ${file.name}`).message)
+          toast.error(
+            mapApiError(
+              err,
+              t('markdownEditor.uploadErrorFallback', { filename: file.name }),
+            ).message,
+          )
         }
       }
     },
-    [editorViewRef, maxAssetUploadSizeBytes, onChange, pageId, setMarkdown],
+    [editorViewRef, maxAssetUploadSizeBytes, onChange, pageId, setMarkdown, t],
   )
 
-  // Set initial markdown value when component mounts
-  // This sets the initial value only once
   useEffect(() => {
-    setMarkdown((prev) => (prev === '' ? initialValue : prev))
+    setMarkdown(initialValue)
   }, [initialValue])
 
   const handleEditorChange = useCallback(
@@ -197,6 +259,95 @@ const MarkdownEditor = (
     },
     [onChange],
   )
+
+  // Rich paste (HTML → Markdown) is only reachable via Ctrl/Cmd+Shift+V and the
+  // toolbar/dropdown buttons for now — plain Ctrl/Cmd+V stays default browser
+  // paste while rich paste is being tested. See MarkdownCodeEditor's
+  // Shift-Mod-v keymap, which calls this same callback.
+  const pasteRich = useCallback(async () => {
+    const startView = editorViewRef.current
+    if (!startView) return
+    let md: string | null = null
+    try {
+      if (typeof navigator.clipboard.read === 'function') {
+        const items = await navigator.clipboard.read()
+        for (const item of items) {
+          if (item.types.includes('text/html')) {
+            const blob = await item.getType('text/html')
+            md = htmlToMarkdown(await blob.text()) || null
+            break
+          }
+        }
+        // Reuse the same clipboard read for the plain-text fallback instead
+        // of issuing a second navigator.clipboard call, which can trigger a
+        // second permission prompt for the same paste action.
+        if (!md) {
+          for (const item of items) {
+            if (item.types.includes('text/plain')) {
+              const blob = await item.getType('text/plain')
+              md = (await blob.text()) || null
+              break
+            }
+          }
+        }
+      }
+    } catch {
+      // clipboard-read permission denied or API unavailable — fall through to readText
+    }
+    if (!md) {
+      try {
+        md = (await navigator.clipboard.readText()) || null
+      } catch {
+        toast.error(t('toolbar.pasteClipboardError'))
+        return
+      }
+    }
+    if (!md) return
+    md = await uploadInlineDataUriImages(md, pageId, maxAssetUploadSizeBytes)
+    // Re-read after awaits: the editor may have been destroyed, or replaced
+    // by a different page's editor (navigation during the async clipboard
+    // read), while this was pending — only proceed if it's still the same
+    // live view the paste was initiated on.
+    const view = editorViewRef.current
+    if (!view || view !== startView) return
+    const sel = view.state.selection.main
+    view.dispatch({
+      changes: { from: sel.from, to: sel.to, insert: md },
+      selection: { anchor: sel.from + md.length },
+    })
+    const newDoc = view.state.doc.toString()
+    setMarkdown(newDoc)
+    onChange(newDoc)
+    view.focus()
+  }, [maxAssetUploadSizeBytes, onChange, pageId, t])
+
+  const pastePlain = useCallback(async () => {
+    const startView = editorViewRef.current
+    if (!startView) return
+    let text: string
+    try {
+      text = await navigator.clipboard.readText()
+    } catch {
+      toast.error(t('toolbar.pasteClipboardError'))
+      return
+    }
+    if (!text) return
+    // Re-read after await: the editor may have been destroyed, or replaced
+    // by a different page's editor (navigation during the async clipboard
+    // read), while this was pending — only proceed if it's still the same
+    // live view the paste was initiated on.
+    const view = editorViewRef.current
+    if (!view || view !== startView) return
+    const sel = view.state.selection.main
+    view.dispatch({
+      changes: { from: sel.from, to: sel.to, insert: text },
+      selection: { anchor: sel.from + text.length },
+    })
+    const newDoc = view.state.doc.toString()
+    setMarkdown(newDoc)
+    onChange(newDoc)
+    view.focus()
+  }, [onChange, t])
 
   useImperativeHandle(ref, () => ({
     insertAtCursor: (text: string) => {
@@ -248,12 +399,7 @@ const MarkdownEditor = (
       if (!view) return
       const docText = view.state.doc.toString()
 
-      // Just replace the filename.
-      // The path remains unchanged, but the filename has to start with '/'
-      const regex = new RegExp(`(!?\\[.*?\\]\\(.*?/?)/${before}(\\))`, 'g')
-
-      const newFilename = after.startsWith('/') ? after.slice(1) : after
-      const updatedText = docText.replace(regex, `$1/${newFilename}$2`)
+      const updatedText = replaceFilenameInText(docText, before, after)
 
       // Replace the entire document content
       view.dispatch({
@@ -309,6 +455,8 @@ const MarkdownEditor = (
         redo(view)
       }
     },
+    pasteRich,
+    pastePlain,
   }))
 
   const onAssetVersionChange = useCallback(
@@ -421,17 +569,87 @@ const MarkdownEditor = (
     }
   }, [assetVersion, debouncedPreview, scrollPreviewToLine, showPreview])
 
+  useEffect(() => {
+    if (!isResizingSplit || !resizeHandlersRef.current) return
+
+    const { onMouseMove, onMouseUp } = resizeHandlersRef.current
+    document.addEventListener('mousemove', onMouseMove)
+    document.addEventListener('mouseup', onMouseUp)
+
+    return () => {
+      document.removeEventListener('mousemove', onMouseMove)
+      document.removeEventListener('mouseup', onMouseUp)
+    }
+  }, [isResizingSplit])
+
+  useEffect(
+    () => () => {
+      if (!resizeHandlersRef.current) return
+
+      const { onMouseMove, onMouseUp } = resizeHandlersRef.current
+      document.removeEventListener('mousemove', onMouseMove)
+      document.removeEventListener('mouseup', onMouseUp)
+    },
+    [],
+  )
+
+  const handleSplitResize = (event: ReactMouseEvent<HTMLDivElement>) => {
+    if (isMobile || !showPreview) return
+
+    event.preventDefault()
+    event.stopPropagation()
+
+    const startPosition = previewStacked ? event.clientY : event.clientX
+    const startWidth = editorPaneWidth
+    const splitRect = desktopSplitRef.current?.getBoundingClientRect()
+    const splitSize =
+      (previewStacked ? splitRect?.height : splitRect?.width) ||
+      (previewStacked ? window.innerHeight : window.innerWidth)
+
+    const onMouseMove = (moveEvent: MouseEvent) => {
+      const currentPosition = previewStacked
+        ? moveEvent.clientY
+        : moveEvent.clientX
+      const delta = currentPosition - startPosition
+      const nextWidth = clampEditorPaneWidth(
+        startWidth + (delta / splitSize) * 100,
+      )
+
+      liveEditorPaneWidthRef.current = nextWidth
+      setEditorPaneWidth(nextWidth)
+    }
+
+    const onMouseUp = () => {
+      setEditorPaneWidth(liveEditorPaneWidthRef.current)
+      setIsResizingSplit(false)
+      resizeHandlersRef.current = null
+    }
+
+    resizeHandlersRef.current = { onMouseMove, onMouseUp }
+    setIsResizingSplit(true)
+  }
+
   const renderToolbar = useCallback((): JSX.Element => {
     return (
       <MarkdownToolbar
         editorRef={ref as React.RefObject<MarkdownEditorRef>}
         pageId={pageId}
         onTogglePreview={togglePreview}
+        onTogglePreviewLayout={togglePreviewLayout}
         previewVisible={showPreview}
+        previewStacked={previewStacked}
         onAssetVersionChange={onAssetVersionChange}
       />
     )
-  }, [onAssetVersionChange, pageId, ref, showPreview, togglePreview])
+  }, [
+    onAssetVersionChange,
+    pageId,
+    ref,
+    showPreview,
+    previewStacked,
+    togglePreview,
+    togglePreviewLayout,
+  ])
 
   const renderEditor = useCallback(
     (toolbar: boolean = true): JSX.Element => {
@@ -439,18 +657,22 @@ const MarkdownEditor = (
         <>
           {toolbar && renderToolbar()}
           <MarkdownCodeEditor
-            initialValue={initialValue}
+            initialValue={markdown}
+            resetKey={pageId}
             onChange={handleEditorChange}
             onCursorLineChange={onCursorLineChange}
             editorViewRef={editorViewRef}
             lineWrap={lineWrap}
+            onPasteRich={pasteRich}
           />
         </>
       )
     },
     [
       handleEditorChange,
-      initialValue,
+      markdown,
+      pageId,
+      pasteRich,
       lineWrap,
       onCursorLineChange,
       renderToolbar,
@@ -475,24 +697,24 @@ const MarkdownEditor = (
     )
   }, [assetVersion, debouncedPreview, setPreviewRef, path])
 
-  // TODO: Known Issues:
-  // * When we resize the window, the preview does not update immediately.
-  // * I will leave the issue open for now. (You can validate this by resizing the window in the edit mode)
-
   return (
-    <div
-      className="markdown-editor"
-      key={isMobile ? 'mobile' : 'desktop'}
-      onPaste={handlePaste}
-    >
+    <div className="markdown-editor" onPaste={handlePaste}>
       {/* Mobile */}
       {isMobile && (
         <div className="markdown-editor__mobile">
           {/* Mobile Tabs */}
           <div className="markdown-editor__tabs" role="tablist">
             {[
-              { id: 'editor', label: 'Editor', icon: <Code2 size={16} /> },
-              { id: 'preview', label: 'Preview', icon: <Eye size={16} /> },
+              {
+                id: 'editor',
+                label: t('markdownEditor.editorTab'),
+                icon: <Code2 size={16} />,
+              },
+              {
+                id: 'preview',
+                label: t('markdownEditor.previewTab'),
+                icon: <Eye size={16} />,
+              },
             ].map((tab) => (
               <button
                 key={tab.id}
@@ -539,12 +761,24 @@ const MarkdownEditor = (
       {!isMobile && (
         <div className="flex h-full w-full flex-col">
           {renderToolbar()}
-          <div className="flex w-full flex-1 overflow-hidden">
+          <div
+            ref={desktopSplitRef}
+            className={
+              previewStacked && showPreview
+                ? 'markdown-editor__stacked-layout'
+                : 'flex w-full flex-1 overflow-hidden'
+            }
+          >
             <div
               className={
                 showPreview
-                  ? 'custom-scrollbar markdown-editor__editor-pane markdown-editor__editor-pane--half'
+                  ? previewStacked
+                    ? 'custom-scrollbar markdown-editor__editor-pane markdown-editor__editor-pane--stacked'
+                    : 'custom-scrollbar markdown-editor__editor-pane markdown-editor__editor-pane--half'
                   : 'custom-scrollbar markdown-editor__editor-pane markdown-editor__editor-pane--full'
+              }
+              style={
+                showPreview ? { flex: `0 0 ${editorPaneWidth}%` } : undefined
               }
             >
               {renderEditor(false)}
@@ -553,11 +787,42 @@ const MarkdownEditor = (
             {showPreview && (
               <>
                 <div
-                  className="markdown-editor__divider"
+                  className={
+                    previewStacked
+                      ? `markdown-editor__divider markdown-editor__divider--stacked ${
+                          isResizingSplit
+                            ? 'markdown-editor__divider--active'
+                            : ''
+                        }`
+                      : `markdown-editor__divider ${
+                          isResizingSplit
+                            ? 'markdown-editor__divider--active'
+                            : ''
+                        }`
+                  }
                   id="editor-preview-divider"
-                ></div>
+                  onMouseDown={handleSplitResize}
+                  role="separator"
+                  aria-orientation={previewStacked ? 'horizontal' : 'vertical'}
+                  aria-label={t('markdownEditor.resizeAriaLabel')}
+                  aria-valuemin={MIN_EDITOR_PANE_WIDTH}
+                  aria-valuemax={MAX_EDITOR_PANE_WIDTH}
+                  aria-valuenow={Math.round(editorPaneWidth)}
+                  data-testid="editor-preview-resize-handle"
+                />
 
-                <div className="markdown-editor__preview-container">
+                <div
+                  className={
+                    previewStacked
+                      ? 'markdown-editor__preview-container markdown-editor__preview-container--stacked'
+                      : 'markdown-editor__preview-container'
+                  }
+                  style={
+                    previewStacked
+                      ? { flex: '1 1 0', minHeight: 0 }
+                      : { flex: '1 1 0', minWidth: 0 }
+                  }
+                >
                   {renderPreview()}
                 </div>
               </>

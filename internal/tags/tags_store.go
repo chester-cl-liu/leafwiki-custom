@@ -3,7 +3,6 @@ package tags
 import (
 	"database/sql"
 	"fmt"
-	"log/slog"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -11,6 +10,11 @@ import (
 	"github.com/perber/wiki/internal/core/shared"
 	"github.com/perber/wiki/internal/core/shared/sqliteutil"
 	_ "modernc.org/sqlite"
+)
+
+const (
+	logCloseRowsFailed = "could not close rows"
+	sqlLimitFmt        = " LIMIT %d"
 )
 
 type TagsStore struct {
@@ -27,28 +31,22 @@ func NewTagsStore(storageDir string) (*TagsStore, error) {
 	normalized := filepath.FromSlash(strings.ReplaceAll(storageDir, `\`, `/`))
 	dbPath := filepath.Join(normalized, "tags.db")
 
-	db, err := sql.Open("sqlite", dbPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open tags database: %w", err)
-	}
-
-	s := &TagsStore{db: db}
-	if err := s.ensureSchema(); err != nil {
-		_ = db.Close()
-		if !sqliteutil.IsSQLiteRecoverableError(err) {
-			return nil, err
-		}
-		slog.Default().Warn("tags database corrupt, removing and retrying", "error", err)
-		sqliteutil.RemoveSQLiteFiles(dbPath)
-		db, err = sql.Open("sqlite", dbPath)
+	s := &TagsStore{}
+	err := sqliteutil.RetryOnCorruption(dbPath, func() error {
+		db, err := sql.Open("sqlite", dbPath+"?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)")
 		if err != nil {
-			return nil, fmt.Errorf("failed to reopen tags database after recovery: %w", err)
+			return fmt.Errorf("failed to open tags database: %w", err)
 		}
-		s = &TagsStore{db: db}
-		if err = s.ensureSchema(); err != nil {
+		s.db = db
+		if err := s.ensureSchema(); err != nil {
 			_ = db.Close()
-			return nil, err
+			s.db = nil
+			return err
 		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	return s, nil
 }
@@ -178,6 +176,49 @@ func (s *TagsStore) DeletePageIndex(pageID string) error {
 	return tx.Commit()
 }
 
+// DeletePageIndexes removes tags and meta for all given pages in one
+// transaction, instead of one transaction per page — used by subtree
+// deletes, which can affect hundreds of pages in a single call.
+func (s *TagsStore) DeletePageIndexes(pageIDs []string) error {
+	if len(pageIDs) == 0 {
+		return nil
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = tx.Rollback()
+	}()
+
+	tagsStmt, err := tx.Prepare(`DELETE FROM page_tags WHERE page_id = ?`)
+	if err != nil {
+		return err
+	}
+	defer shared.LogClose(tagsStmt.Close, "could not close statement")
+
+	metaStmt, err := tx.Prepare(`DELETE FROM page_meta WHERE page_id = ?`)
+	if err != nil {
+		return err
+	}
+	defer shared.LogClose(metaStmt.Close, "could not close statement")
+
+	for _, pageID := range pageIDs {
+		if _, err := tagsStmt.Exec(pageID); err != nil {
+			return fmt.Errorf("failed to delete tags for page %s: %w", pageID, err)
+		}
+		if _, err := metaStmt.Exec(pageID); err != nil {
+			return fmt.Errorf("failed to delete meta for page %s: %w", pageID, err)
+		}
+	}
+
+	return tx.Commit()
+}
+
 // GetExcerptsForPages returns a map of pageID → excerpt for the given page IDs.
 func (s *TagsStore) GetExcerptsForPages(pageIDs []string) (map[string]string, error) {
 	s.mu.Lock()
@@ -200,7 +241,7 @@ func (s *TagsStore) GetExcerptsForPages(pageIDs []string) (map[string]string, er
 	if err != nil {
 		return nil, err
 	}
-	defer shared.LogClose(rows.Close, "could not close rows")
+	defer shared.LogClose(rows.Close, logCloseRowsFailed)
 
 	result := make(map[string]string)
 	for rows.Next() {
@@ -245,14 +286,14 @@ func (s *TagsStore) GetAllTags(filter string, limit int) ([]TagCount, error) {
 		ORDER BY count DESC, tag ASC
 	`
 	if limit > 0 {
-		query += fmt.Sprintf(" LIMIT %d", limit)
+		query += fmt.Sprintf(sqlLimitFmt, limit)
 	}
 
 	rows, err := s.db.Query(query, escapeLikePrefix(filter))
 	if err != nil {
 		return nil, err
 	}
-	defer shared.LogClose(rows.Close, "could not close rows")
+	defer shared.LogClose(rows.Close, logCloseRowsFailed)
 
 	var result []TagCount
 	for rows.Next() {
@@ -304,14 +345,14 @@ func (s *TagsStore) GetAllTagsForSelection(filter string, selected []string, lim
 		ORDER BY count DESC, tag ASC
 	`, selectionPlaceholders, selectionPlaceholders)
 	if limit > 0 {
-		query += fmt.Sprintf(" LIMIT %d", limit)
+		query += fmt.Sprintf(sqlLimitFmt, limit)
 	}
 
 	rows, err := s.db.Query(query, args...)
 	if err != nil {
 		return nil, err
 	}
-	defer shared.LogClose(rows.Close, "could not close rows")
+	defer shared.LogClose(rows.Close, logCloseRowsFailed)
 
 	var result []TagCount
 	for rows.Next() {
@@ -350,7 +391,7 @@ func (s *TagsStore) GetPageIDsByTags(tags []string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer shared.LogClose(rows.Close, "could not close rows")
+	defer shared.LogClose(rows.Close, logCloseRowsFailed)
 
 	var pageIDs []string
 	for rows.Next() {
@@ -372,14 +413,14 @@ func (s *TagsStore) getAllTagsLocked(filter string, limit int) ([]TagCount, erro
 		ORDER BY count DESC, tag ASC
 	`
 	if limit > 0 {
-		query += fmt.Sprintf(" LIMIT %d", limit)
+		query += fmt.Sprintf(sqlLimitFmt, limit)
 	}
 
 	rows, err := s.db.Query(query, escapeLikePrefix(filter))
 	if err != nil {
 		return nil, err
 	}
-	defer shared.LogClose(rows.Close, "could not close rows")
+	defer shared.LogClose(rows.Close, logCloseRowsFailed)
 
 	var result []TagCount
 	for rows.Next() {
@@ -415,7 +456,7 @@ func (s *TagsStore) GetTagsForPages(pageIDs []string) (map[string][]string, erro
 	if err != nil {
 		return nil, err
 	}
-	defer shared.LogClose(rows.Close, "could not close rows")
+	defer shared.LogClose(rows.Close, logCloseRowsFailed)
 
 	result := make(map[string][]string)
 	for rows.Next() {

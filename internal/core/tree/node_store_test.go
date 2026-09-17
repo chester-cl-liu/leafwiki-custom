@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/perber/wiki/internal/core/ignore"
 	"github.com/perber/wiki/internal/core/markdown"
 )
 
@@ -540,6 +541,222 @@ func TestNodeStore_UpsertContentPreservingFrontmatter_MergesExtrasIntoWrittenFro
 	}
 	if fm.LeafWikiID != "p1" {
 		t.Fatalf("expected managed leafwiki_id, got %q", fm.LeafWikiID)
+	}
+}
+
+// ─── UpsertContentAndMetadata ────────────────────────────────────────────────
+
+// UpsertContentAndMetadata is the UI-edit path: it replaces the body and the
+// UI-managed frontmatter fields (tags + properties) while preserving any
+// pass-through ExtraFields that the UI never surfaced (e.g. "title" alongside
+// "leafwiki_title", "permalink", "aliases", etc.).
+
+func TestNodeStore_UpsertContentAndMetadata_UpdatesBodyAndTags(t *testing.T) {
+	tmp := t.TempDir()
+	store := NewNodeStore(tmp)
+
+	root := &PageNode{ID: "root", Slug: "root", Title: "root", Kind: NodeKindSection}
+	page := &PageNode{ID: "p1", Slug: "p", Title: "My Page", Kind: NodeKindPage, Parent: root}
+
+	path := filepath.Join(tmp, "root", "p.md")
+	mustWriteFile(t, path, "---\nleafwiki_id: p1\nleafwiki_title: My Page\n---\n# old\n", 0o644)
+
+	tags := []string{"go", "react"}
+	if err := store.UpsertContentAndMetadata(page, "# new", tags, nil); err != nil {
+		t.Fatalf("UpsertContentAndMetadata: %v", err)
+	}
+
+	raw := string(mustRead(t, path))
+	fm, body, _, err := markdown.ParseFrontmatter(raw)
+	if err != nil {
+		t.Fatalf("ParseFrontmatter: %v", err)
+	}
+	if strings.TrimSpace(body) != "# new" {
+		t.Fatalf("expected body '# new', got %q", body)
+	}
+	if fm.LeafWikiID != "p1" {
+		t.Fatalf("expected leafwiki_id p1, got %q", fm.LeafWikiID)
+	}
+	rawTags, _ := fm.ExtraFields["tags"].([]interface{})
+	if len(rawTags) != 2 {
+		t.Fatalf("expected 2 tags, got %v", rawTags)
+	}
+}
+
+func TestNodeStore_UpsertContentAndMetadata_UpdatesProperties(t *testing.T) {
+	tmp := t.TempDir()
+	store := NewNodeStore(tmp)
+
+	root := &PageNode{ID: "root", Slug: "root", Title: "root", Kind: NodeKindSection}
+	page := &PageNode{ID: "p1", Slug: "p", Title: "My Page", Kind: NodeKindPage, Parent: root}
+
+	path := filepath.Join(tmp, "root", "p.md")
+	mustWriteFile(t, path, "---\nleafwiki_id: p1\nleafwiki_title: My Page\nstatus: draft\n---\n# old\n", 0o644)
+
+	props := map[string]string{"status": "published", "author": "alice"}
+	if err := store.UpsertContentAndMetadata(page, "# updated", nil, props); err != nil {
+		t.Fatalf("UpsertContentAndMetadata: %v", err)
+	}
+
+	raw := string(mustRead(t, path))
+	fm, _, _, err := markdown.ParseFrontmatter(raw)
+	if err != nil {
+		t.Fatalf("ParseFrontmatter: %v", err)
+	}
+	if fm.ExtraFields["status"] != "published" {
+		t.Fatalf("expected status=published, got %v", fm.ExtraFields["status"])
+	}
+	if fm.ExtraFields["author"] != "alice" {
+		t.Fatalf("expected author=alice, got %v", fm.ExtraFields["author"])
+	}
+}
+
+func TestNodeStore_UpsertContentAndMetadata_TitleAsCustomPropertyRoundtrips(t *testing.T) {
+	// Regression test: after Phase 1, "title" alongside "leafwiki_title" is
+	// surfaced to the editor and included in incoming properties. It must be
+	// written back to disk.
+	tmp := t.TempDir()
+	store := NewNodeStore(tmp)
+
+	root := &PageNode{ID: "root", Slug: "root", Title: "root", Kind: NodeKindSection}
+	page := &PageNode{ID: "p1", Slug: "p", Title: "My Page", Kind: NodeKindPage, Parent: root}
+
+	path := filepath.Join(tmp, "root", "p.md")
+	mustWriteFile(t, path, "---\nleafwiki_id: p1\nleafwiki_title: My Page\ntitle: My Custom Title\nstatus: draft\n---\n# old\n", 0o644)
+
+	// The editor sends title back in properties (because Phase 1 makes it visible).
+	props := map[string]string{"title": "My Custom Title", "status": "published"}
+	if err := store.UpsertContentAndMetadata(page, "# edited", nil, props); err != nil {
+		t.Fatalf("UpsertContentAndMetadata: %v", err)
+	}
+
+	raw := string(mustRead(t, path))
+	fm, _, _, err := markdown.ParseFrontmatter(raw)
+	if err != nil {
+		t.Fatalf("ParseFrontmatter: %v", err)
+	}
+	if fm.ExtraFields["title"] != "My Custom Title" {
+		t.Fatalf("title must survive round-trip, got %v", fm.ExtraFields["title"])
+	}
+	if fm.ExtraFields["status"] != "published" {
+		t.Fatalf("expected status=published, got %v", fm.ExtraFields["status"])
+	}
+}
+
+func TestNodeStore_UpsertContentAndMetadata_UnsentFieldsAreDropped(t *testing.T) {
+	// Properties the user removed from the editor must not linger in the file.
+	tmp := t.TempDir()
+	store := NewNodeStore(tmp)
+
+	root := &PageNode{ID: "root", Slug: "root", Title: "root", Kind: NodeKindSection}
+	page := &PageNode{ID: "p1", Slug: "p", Title: "My Page", Kind: NodeKindPage, Parent: root}
+
+	path := filepath.Join(tmp, "root", "p.md")
+	mustWriteFile(t, path, "---\nleafwiki_id: p1\nleafwiki_title: My Page\nstatus: draft\npermalink: /my-page\n---\n# body\n", 0o644)
+
+	// User saves without "permalink" — it was deleted in the editor.
+	if err := store.UpsertContentAndMetadata(page, "# body", nil, map[string]string{"status": "draft"}); err != nil {
+		t.Fatalf("UpsertContentAndMetadata: %v", err)
+	}
+
+	raw := string(mustRead(t, path))
+	fm, _, _, err := markdown.ParseFrontmatter(raw)
+	if err != nil {
+		t.Fatalf("ParseFrontmatter: %v", err)
+	}
+	if _, ok := fm.ExtraFields["permalink"]; ok {
+		t.Fatal("permalink must have been dropped — user did not send it back")
+	}
+}
+
+func TestNodeStore_UpsertContentAndMetadata_RemovedPropertyDoesNotPersist(t *testing.T) {
+	// A property the user deleted from the editor must not survive the save.
+	tmp := t.TempDir()
+	store := NewNodeStore(tmp)
+
+	root := &PageNode{ID: "root", Slug: "root", Title: "root", Kind: NodeKindSection}
+	page := &PageNode{ID: "p1", Slug: "p", Title: "My Page", Kind: NodeKindPage, Parent: root}
+
+	path := filepath.Join(tmp, "root", "p.md")
+	mustWriteFile(t, path, "---\nleafwiki_id: p1\nleafwiki_title: My Page\nstatus: draft\nauthor: alice\n---\n# body\n", 0o644)
+
+	// User removed "author"; only "status" is sent back.
+	if err := store.UpsertContentAndMetadata(page, "# body", nil, map[string]string{"status": "draft"}); err != nil {
+		t.Fatalf("UpsertContentAndMetadata: %v", err)
+	}
+
+	raw := string(mustRead(t, path))
+	fm, _, _, err := markdown.ParseFrontmatter(raw)
+	if err != nil {
+		t.Fatalf("ParseFrontmatter: %v", err)
+	}
+	if _, ok := fm.ExtraFields["author"]; ok {
+		t.Fatal("author must have been removed from frontmatter")
+	}
+}
+
+func TestNodeStore_UpsertContentAndMetadata_NilTagsPreservesExistingTags(t *testing.T) {
+	// Regression: when tags == nil the existing on-disk tags must survive a
+	// property-only save, not be silently cleared.
+	tmp := t.TempDir()
+	store := NewNodeStore(tmp)
+
+	root := &PageNode{ID: "root", Slug: "root", Title: "root", Kind: NodeKindSection}
+	page := &PageNode{ID: "p1", Slug: "p", Title: "My Page", Kind: NodeKindPage, Parent: root}
+
+	path := filepath.Join(tmp, "root", "p.md")
+	mustWriteFile(t, path, "---\nleafwiki_id: p1\nleafwiki_title: My Page\ntags:\n  - go\n  - wiki\nstatus: draft\n---\n# body\n", 0o644)
+
+	// Save with properties only — no tags field (nil means "leave unchanged").
+	if err := store.UpsertContentAndMetadata(page, "# body", nil, map[string]string{"status": "published"}); err != nil {
+		t.Fatalf("UpsertContentAndMetadata: %v", err)
+	}
+
+	raw := string(mustRead(t, path))
+	fm, _, _, err := markdown.ParseFrontmatter(raw)
+	if err != nil {
+		t.Fatalf("ParseFrontmatter: %v", err)
+	}
+	rawTags, _ := fm.ExtraFields["tags"].([]interface{})
+	if len(rawTags) != 2 {
+		t.Fatalf("nil tags must preserve existing tags, got %v", rawTags)
+	}
+}
+
+func TestNodeStore_UpsertContentAndMetadata_NonStringFieldsPreserved(t *testing.T) {
+	// Regression: bool, int, and non-tag list ExtraFields must survive an edit
+	// because the editor cannot represent them and never sends them back.
+	tmp := t.TempDir()
+	store := NewNodeStore(tmp)
+
+	root := &PageNode{ID: "root", Slug: "root", Title: "root", Kind: NodeKindSection}
+	page := &PageNode{ID: "p1", Slug: "p", Title: "My Page", Kind: NodeKindPage, Parent: root}
+
+	path := filepath.Join(tmp, "root", "p.md")
+	mustWriteFile(t, path, "---\nleafwiki_id: p1\nleafwiki_title: My Page\npublished: true\npriority: 42\naliases:\n  - /old-path\nstatus: draft\n---\n# body\n", 0o644)
+
+	// Editor only sends back the string property; non-string fields are absent.
+	if err := store.UpsertContentAndMetadata(page, "# body", nil, map[string]string{"status": "published"}); err != nil {
+		t.Fatalf("UpsertContentAndMetadata: %v", err)
+	}
+
+	raw := string(mustRead(t, path))
+	fm, _, _, err := markdown.ParseFrontmatter(raw)
+	if err != nil {
+		t.Fatalf("ParseFrontmatter: %v", err)
+	}
+	if fm.ExtraFields["published"] != true {
+		t.Fatalf("bool field published must be preserved, got %v", fm.ExtraFields["published"])
+	}
+	if fm.ExtraFields["priority"] != 42 {
+		t.Fatalf("int field priority must be preserved, got %v", fm.ExtraFields["priority"])
+	}
+	aliases, _ := fm.ExtraFields["aliases"].([]interface{})
+	if len(aliases) != 1 {
+		t.Fatalf("list field aliases must be preserved, got %v", fm.ExtraFields["aliases"])
+	}
+	if fm.ExtraFields["status"] != "published" {
+		t.Fatalf("string property must be updated, got %v", fm.ExtraFields["status"])
 	}
 }
 
@@ -1396,4 +1613,136 @@ func mustRead(t *testing.T, path string) []byte {
 		t.Fatalf("read %s: %v", path, err)
 	}
 	return b
+}
+
+// --- Phase 3: write operation guards for .leafwikiignore ---
+
+func TestNodeStore_CreatePage_RejectsIgnoredPath(t *testing.T) {
+	tmp := t.TempDir()
+	store := NewNodeStore(tmp)
+
+	mustWriteFile(t, filepath.Join(tmp, "root", ".leafwikiignore"), "drafts", 0o644)
+
+	cache := ignore.NewCache(filepath.Join(tmp, "root"))
+	store.SetIgnoreCache(cache)
+
+	root := &PageNode{ID: "root", Slug: "root", Title: "root", Kind: NodeKindSection}
+	entry := &PageNode{ID: "p1", Slug: "drafts", Title: "Drafts", Kind: NodeKindPage, Parent: root}
+
+	err := store.CreatePage(root, entry)
+	if err == nil {
+		t.Fatal("expected error for ignored path")
+	}
+	var opErr *InvalidOpError
+	if !errors.As(err, &opErr) {
+		t.Fatalf("expected InvalidOpError, got %T: %v", err, err)
+	}
+	if !strings.Contains(opErr.Reason, "leafwikiignore") {
+		t.Fatalf("expected reason mentioning leafwikiignore, got %q", opErr.Reason)
+	}
+}
+
+func TestNodeStore_CreateSection_RejectsIgnoredPath(t *testing.T) {
+	tmp := t.TempDir()
+	store := NewNodeStore(tmp)
+
+	mustWriteFile(t, filepath.Join(tmp, "root", ".leafwikiignore"), "archive", 0o644)
+
+	cache := ignore.NewCache(filepath.Join(tmp, "root"))
+	store.SetIgnoreCache(cache)
+
+	root := &PageNode{ID: "root", Slug: "root", Title: "root", Kind: NodeKindSection}
+	entry := &PageNode{ID: "s1", Slug: "archive", Title: "Archive", Kind: NodeKindSection, Parent: root}
+
+	err := store.CreateSection(root, entry)
+	if err == nil {
+		t.Fatal("expected error for ignored path")
+	}
+	var opErr *InvalidOpError
+	if !errors.As(err, &opErr) {
+		t.Fatalf("expected InvalidOpError, got %T: %v", err, err)
+	}
+	if !strings.Contains(opErr.Reason, "leafwikiignore") {
+		t.Fatalf("expected reason mentioning leafwikiignore, got %q", opErr.Reason)
+	}
+}
+
+func TestNodeStore_MoveNode_RejectsIgnoredDestination(t *testing.T) {
+	tmp := t.TempDir()
+	store := NewNodeStore(tmp)
+
+	mustWriteFile(t, filepath.Join(tmp, "root", ".leafwikiignore"), "archive/", 0o644)
+
+	cache := ignore.NewCache(filepath.Join(tmp, "root"))
+	store.SetIgnoreCache(cache)
+
+	root := &PageNode{ID: "root", Slug: "root", Title: "root", Kind: NodeKindSection}
+	sec := &PageNode{ID: "s", Slug: "s", Title: "S", Kind: NodeKindSection, Parent: root}
+	page := &PageNode{ID: "p1", Slug: "p", Title: "P", Kind: NodeKindPage, Parent: sec}
+
+	mustMkdir(t, filepath.Join(tmp, "root", "s"))
+	mustWriteFile(t, filepath.Join(tmp, "root", "s", "p.md"), "# hi", 0o644)
+
+	mustMkdir(t, filepath.Join(tmp, "root", "archive"))
+	mustWriteFile(t, filepath.Join(tmp, "root", "archive", "index.md"), "# Archive", 0o644)
+	archiveSection := &PageNode{ID: "s2", Slug: "archive", Title: "Archive", Kind: NodeKindSection, Parent: root}
+
+	err := store.MoveNode(page, archiveSection)
+	if err == nil {
+		t.Fatal("expected error for ignored destination")
+	}
+	var opErr *InvalidOpError
+	if !errors.As(err, &opErr) {
+		t.Fatalf("expected InvalidOpError, got %T: %v", err, err)
+	}
+	if !strings.Contains(opErr.Reason, "leafwikiignore") {
+		t.Fatalf("expected reason mentioning leafwikiignore, got %q", opErr.Reason)
+	}
+}
+
+func TestNodeStore_RenameNode_RejectsIgnoredSlug(t *testing.T) {
+	tmp := t.TempDir()
+	store := NewNodeStore(tmp)
+
+	mustWriteFile(t, filepath.Join(tmp, "root", ".leafwikiignore"), "*.tmp", 0o644)
+
+	cache := ignore.NewCache(filepath.Join(tmp, "root"))
+	store.SetIgnoreCache(cache)
+
+	root := &PageNode{ID: "root", Slug: "root", Title: "root", Kind: NodeKindSection}
+	page := &PageNode{ID: "p1", Slug: "notes", Title: "Notes", Kind: NodeKindPage, Parent: root}
+	mustWriteFile(t, filepath.Join(tmp, "root", "notes.md"), "# Notes", 0o644)
+
+	err := store.RenameNode(page, "notes.tmp")
+	if err == nil {
+		t.Fatal("expected error for ignored slug")
+	}
+	var opErr *InvalidOpError
+	if !errors.As(err, &opErr) {
+		t.Fatalf("expected InvalidOpError, got %T: %v", err, err)
+	}
+	if !strings.Contains(opErr.Reason, "leafwikiignore") {
+		t.Fatalf("expected reason mentioning leafwikiignore, got %q", opErr.Reason)
+	}
+}
+
+func TestNodeStore_CreatePage_PassesThroughNonIgnoredPath(t *testing.T) {
+	tmp := t.TempDir()
+	store := NewNodeStore(tmp)
+
+	mustWriteFile(t, filepath.Join(tmp, "root", ".leafwikiignore"), "*.log", 0o644)
+
+	cache := ignore.NewCache(filepath.Join(tmp, "root"))
+	store.SetIgnoreCache(cache)
+
+	root := &PageNode{ID: "root", Slug: "root", Title: "root", Kind: NodeKindSection}
+	entry := &PageNode{ID: "p1", Slug: "readme", Title: "Readme", Kind: NodeKindPage, Parent: root}
+
+	err := store.CreatePage(root, entry)
+	if err != nil {
+		t.Fatalf("expected no error for non-ignored path, got %v", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(tmp, "root", "readme.md")); statErr != nil {
+		t.Fatalf("expected readme.md to exist: %v", statErr)
+	}
 }

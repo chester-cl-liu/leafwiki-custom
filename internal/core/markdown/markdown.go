@@ -115,6 +115,10 @@ func (mf *MarkdownFile) SetContent(content string) {
 	mf.content = content
 }
 
+func (mf *MarkdownFile) SetExtraFields(fields map[string]interface{}) {
+	mf.fm.ExtraFields = fields
+}
+
 func (mf *MarkdownFile) SetRawContentPreservingManagedFrontmatter(raw string) error {
 	incomingFM, body, has, err := ParseFrontmatter(raw)
 	if err != nil {
@@ -157,4 +161,8 @@ func (mf *MarkdownFile) SetLeafWikiMetadata(createdAt string, updatedAt string, 
 	mf.fm.LeafWikiUpdatedAt = strings.TrimSpace(updatedAt)
 	mf.fm.LeafWikiCreatorID = strings.TrimSpace(creatorID)
 	mf.fm.LeafWikiLastAuthorID = strings.TrimSpace(lastAuthorID)
+}
+
+func (mf *MarkdownFile) SetLeafWikiPinned(pinned bool) {
+	mf.fm.LeafWikiPinned = pinned
 }

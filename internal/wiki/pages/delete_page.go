@@ -3,10 +3,13 @@ package pages
 import (
 	"context"
 	"log/slog"
+	"time"
 
 	"github.com/perber/wiki/internal/core/assets"
 	"github.com/perber/wiki/internal/core/revision"
 	"github.com/perber/wiki/internal/core/tree"
+	"github.com/perber/wiki/internal/favorites"
+	httpmetrics "github.com/perber/wiki/internal/http/metrics"
 	"github.com/perber/wiki/internal/wiki/pagesave"
 )
 
@@ -23,8 +26,10 @@ type DeletePageUseCase struct {
 	tree         *tree.TreeService
 	revision     *revision.Service
 	assets       *assets.AssetService
+	favorites    *favorites.FavoritesStore
 	orchestrator *pagesave.PageSaveOrchestrator
 	log          *slog.Logger
+	metrics      *httpmetrics.HTTPMetrics
 }
 
 // NewDeletePageUseCase constructs a DeletePageUseCase.
@@ -32,14 +37,21 @@ func NewDeletePageUseCase(
 	t *tree.TreeService,
 	r *revision.Service,
 	a *assets.AssetService,
+	f *favorites.FavoritesStore,
 	o *pagesave.PageSaveOrchestrator,
 	log *slog.Logger,
+	metrics *httpmetrics.HTTPMetrics,
 ) *DeletePageUseCase {
-	return &DeletePageUseCase{tree: t, revision: r, assets: a, orchestrator: o, log: log}
+	return &DeletePageUseCase{tree: t, revision: r, assets: a, favorites: f, orchestrator: o, log: log, metrics: metrics}
 }
 
 // Execute deletes the page, cleaning up links (via orchestrator), assets, and revision data.
-func (uc *DeletePageUseCase) Execute(_ context.Context, in DeletePageInput) error {
+func (uc *DeletePageUseCase) Execute(_ context.Context, in DeletePageInput) (err error) {
+	started := time.Now()
+	defer func() {
+		uc.metrics.ObservePageSaveWorkflow(string(pagesave.PageOperationDelete), err, started)
+	}()
+
 	if in.ID == "root" || in.ID == "" {
 		return newPageRootOperationError("delete")
 	}
@@ -93,6 +105,9 @@ func (uc *DeletePageUseCase) Execute(_ context.Context, in DeletePageInput) erro
 			if err := uc.assets.DeleteAllAssetsForPage(p.PageNode); err != nil {
 				uc.log.Warn("failed to delete assets for page", "pageID", p.ID, "error", err)
 			}
+			if err := uc.favorites.DeleteAllForPage(p.ID); err != nil {
+				uc.log.Warn("failed to delete favorites for page", "pageID", p.ID, "error", err)
+			}
 		}
 
 		return deleteRevisionData(uc.revision, subtreeIDs)
@@ -115,6 +130,9 @@ func (uc *DeletePageUseCase) Execute(_ context.Context, in DeletePageInput) erro
 
 	if err := uc.assets.DeleteAllAssetsForPage(page.PageNode); err != nil {
 		uc.log.Warn("failed to delete assets for page", "pageID", page.ID, "error", err)
+	}
+	if err := uc.favorites.DeleteAllForPage(page.ID); err != nil {
+		uc.log.Warn("failed to delete favorites for page", "pageID", page.ID, "error", err)
 	}
 
 	return deleteRevisionData(uc.revision, []string{in.ID})

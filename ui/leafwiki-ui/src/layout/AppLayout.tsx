@@ -2,32 +2,41 @@ import { DialogManager } from '@/components/DialogManager'
 import { HotKeyHandler } from '@/components/HotKeyHandler'
 import { Button } from '@/components/ui/button'
 import { TooltipProvider } from '@/components/ui/tooltip'
-import UserToolbar from '@/components/UserToolbar'
+import UserMenu from '@/components/UserMenu'
+import { BackupWarningIndicator } from '@/features/backup/BackupWarningIndicator'
 import DesignToggle from '@/features/designtoggle/DesignToggle'
 import { EditorTitleBar } from '@/features/editor/EditorTitleBar'
 import { PageQuickSwitcherTrigger } from '@/features/page-switcher/PageQuickSwitcherTrigger'
 import Progressbar from '@/features/progressbar/Progressbar'
 import Sidebar from '@/features/sidebar/Sidebar'
+import SettingsNav from '@/features/settings/SettingsNav'
 import { Toolbar } from '@/features/toolbar/Toolbar'
 import { withBasePath } from '@/lib/routePath'
 import { useAppMode } from '@/lib/useAppMode'
 import { useAutoCloseSidebarOnMobile } from '@/lib/useAutoCloseSidebarOnMobile'
 import { useIsMobile } from '@/lib/useIsMobile'
+import { useTrackLastWikiLocation } from '@/lib/useTrackLastWikiLocation'
+import { cn } from '@/lib/utils'
 import { useBrandingStore } from '@/stores/branding'
 import {
   MAX_SIDEBAR_WIDTH,
   MIN_SIDEBAR_WIDTH,
   useSidebarStore,
 } from '@/stores/sidebar'
+import { useTocPanelStore } from '@/stores/tocPanel'
 import { MenuIcon } from 'lucide-react'
 import React, { useEffect, useLayoutEffect, useRef, useState } from 'react'
-import { Link } from 'react-router-dom'
+import { useTranslation } from 'react-i18next'
+import { Link } from 'react-router'
 
 export const MOBILE_SIDEBAR_WIDTH = 320
 
 export default function AppLayout({ children }: { children: React.ReactNode }) {
+  const { t } = useTranslation('viewer')
   const appMode = useAppMode()
   const [isEditor, setIsEditor] = useState(appMode === 'edit')
+
+  useTrackLastWikiLocation()
 
   // store resize handler in onMouseMove, onMouseUp in useRef
   const resizeHandlerRef = useRef<{
@@ -40,6 +49,7 @@ export default function AppLayout({ children }: { children: React.ReactNode }) {
 
   const sidebarVisible = useSidebarStore((s) => s.sidebarVisible)
   const setSidebarVisible = useSidebarStore((s) => s.setSidebarVisible)
+  const tocPanelCollapsed = useTocPanelStore((s) => s.collapsed)
   const sidebarWidth = useSidebarStore((s) => s.sidebarWidth)
   const setSidebarWidth = useSidebarStore((s) => s.setSidebarWidth)
   const isMobile = useIsMobile()
@@ -51,6 +61,7 @@ export default function AppLayout({ children }: { children: React.ReactNode }) {
   const { siteName, logoFile, logoVersion } = useBrandingStore()
 
   const sidebarContainerRef = useRef<HTMLDivElement | null>(null)
+  const sidebarPanelRef = useRef<HTMLDivElement | null>(null)
   const liveSidebarWidthRef = useRef(sidebarWidth)
 
   const handleSidebarResize = (e: React.MouseEvent<HTMLDivElement>) => {
@@ -77,6 +88,9 @@ export default function AppLayout({ children }: { children: React.ReactNode }) {
 
       if (sidebarContainerRef.current) {
         sidebarContainerRef.current.style.width = `${nextWidth}px`
+      }
+      if (sidebarPanelRef.current) {
+        sidebarPanelRef.current.style.width = `${nextWidth}px`
       }
     }
 
@@ -161,14 +175,9 @@ export default function AppLayout({ children }: { children: React.ReactNode }) {
     liveSidebarWidthRef.current = sidebarWidth
   }, [sidebarWidth])
 
-  let mainContainerStyle = !isEditor
-    ? 'custom-scrollbar app-layout__main-content-area-viewer'
+  const mainContainerStyle = !isEditor
+    ? 'app-layout__main-content-area-viewer'
     : 'app-layout__main-content-area-editor'
-
-  // If on mobile and sidebar is visible, hide overflow to prevent double scrollbars
-  if (isMobile && sidebarVisible) {
-    mainContainerStyle += ' overflow-hidden'
-  }
 
   const effectiveSidebarWidth = !sidebarVisible
     ? 0
@@ -190,7 +199,7 @@ export default function AppLayout({ children }: { children: React.ReactNode }) {
               variant={'outline'}
               className="app-layout__sidebar-toggle-button"
               onClick={() => setSidebarVisible(!sidebarVisible)}
-              aria-label="Toggle Sidebar"
+              aria-label={t('layout.toggleSidebar')}
               aria-expanded={sidebarVisible}
               data-testid="sidebar-toggle-button"
             >
@@ -222,7 +231,8 @@ export default function AppLayout({ children }: { children: React.ReactNode }) {
             <PageQuickSwitcherTrigger />
             <DesignToggle />
             <Toolbar />
-            <UserToolbar />
+            <BackupWarningIndicator />
+            <UserMenu />
           </div>
         </div>
       </header>
@@ -254,7 +264,7 @@ export default function AppLayout({ children }: { children: React.ReactNode }) {
               }}
               role="separator"
               aria-orientation="vertical"
-              aria-label="Resize sidebar"
+              aria-label={t('layout.resizeSidebar')}
               data-testid="sidebar-resize-handle"
             >
               <div
@@ -267,7 +277,22 @@ export default function AppLayout({ children }: { children: React.ReactNode }) {
               />
             </div>
           )}
-          <Sidebar />
+          {/*
+            Rendered at its final width at all times and only ever moved via
+            transform. This keeps the sidebar's own content (tree labels etc.)
+            from re-wrapping through every intermediate width while the outer
+            container's width animates open/closed.
+          */}
+          <div
+            ref={sidebarPanelRef}
+            className="app-layout__sidebar-panel transition-transform duration-200"
+            style={{
+              width: isMobile ? MOBILE_SIDEBAR_WIDTH : sidebarWidth,
+              transform: sidebarVisible ? 'translateX(0)' : 'translateX(-100%)',
+            }}
+          >
+            {appMode === 'settings' ? <SettingsNav /> : <Sidebar />}
+          </div>
         </div>
 
         {/* Overlay for mobile sidebar */}
@@ -276,18 +301,29 @@ export default function AppLayout({ children }: { children: React.ReactNode }) {
             type="button"
             className="app-layout__sidebar-overlay-mobile"
             onClick={() => setSidebarVisible(false)}
-            aria-label="Close sidebar"
+            aria-label={t('layout.closeSidebar')}
           />
         )}
         <div className="app-layout__main-column">
           <div id="app-subheader-root" className="app-layout__subheader-root" />
-          {/* Main content area */}
-          <main
-            className={`${mainContainerStyle} app-layout__main-content-area`}
+          <div
             id="scroll-container"
+            className={`app-layout__content-row custom-scrollbar${isMobile && sidebarVisible ? 'overflow-hidden' : ''}`}
           >
-            {children}
-          </main>
+            {/* Main content area */}
+            <main
+              className={`${mainContainerStyle} app-layout__main-content-area`}
+            >
+              {children}
+            </main>
+            <div
+              id="app-toc-pane-root"
+              className={cn(
+                'app-layout__toc-pane',
+                tocPanelCollapsed && 'app-layout__toc-pane--collapsed',
+              )}
+            />
+          </div>
         </div>
       </div>
     </TooltipProvider>

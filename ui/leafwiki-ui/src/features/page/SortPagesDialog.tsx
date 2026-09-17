@@ -1,7 +1,8 @@
 // components/page/SortPagesDialog.tsx
 import BaseDialog from '@/components/BaseDialog'
 import { Button } from '@/components/ui/button'
-import { NODE_KIND_PAGE, PageNode, sortPages } from '@/lib/api/pages'
+import { NODE_KIND_PAGE, NODE_KIND_SECTION, sortPages } from '@/lib/api/pages'
+import type { PageNode } from '@/lib/api/pages'
 import { handleFieldErrors } from '@/lib/handleFieldErrors'
 import { DIALOG_SORT_PAGES } from '@/lib/registries'
 import { useTreeStore } from '@/stores/tree'
@@ -24,6 +25,7 @@ import {
 import { CSS } from '@dnd-kit/utilities'
 import { ArrowDown, ArrowUp, GripVertical } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
+import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 
 function SortableItem({
@@ -32,12 +34,14 @@ function SortableItem({
   index,
   total,
   onMove,
+  dragHandleLabel,
 }: {
   id: string
   title: string
   index: number
   total: number
   onMove: (index: number, direction: -1 | 1) => void
+  dragHandleLabel: string
 }) {
   const {
     attributes,
@@ -63,7 +67,7 @@ function SortableItem({
     >
       <button
         className="sort-pages-dialog__drag-handle"
-        aria-label="Drag to reorder"
+        aria-label={dragHandleLabel}
         {...attributes}
         {...listeners}
       >
@@ -100,10 +104,15 @@ function SortableItem({
 }
 
 export function SortPagesDialog({ parent }: { parent: PageNode }) {
-  const itemLabel = parent.kind === NODE_KIND_PAGE ? 'page' : 'section'
+  const { t } = useTranslation('page')
+  const itemLabel =
+    parent.kind === NODE_KIND_PAGE ? t('common.page') : t('common.section')
   const itemLabelCapitalized =
-    parent.kind === NODE_KIND_PAGE ? 'Page' : 'Section'
+    parent.kind === NODE_KIND_PAGE
+      ? t('common.pageCapitalized')
+      : t('common.sectionCapitalized')
   const [order, setOrder] = useState(parent.children?.map((c) => c.id) || [])
+  const [sortDirection, setSortDirection] = useState<'asc' | 'desc'>('asc')
   const [loading, setLoading] = useState(false)
   const [, setFieldErrors] = useState<Record<string, string>>({})
   const reloadTree = useTreeStore((s) => s.reloadTree)
@@ -149,11 +158,24 @@ export function SortPagesDialog({ parent }: { parent: PageNode }) {
     }
   }
 
-  const sortAlphabetically = (direction: 'asc' | 'desc') => {
+  const applySort = (
+    direction: 'asc' | 'desc',
+    sectionPosition?: 'first' | 'last',
+  ) => {
     setOrder((prev) =>
       [...prev].sort((a, b) => {
-        const titleA = nodeMap.get(a)?.title ?? ''
-        const titleB = nodeMap.get(b)?.title ?? ''
+        const nodeA = nodeMap.get(a)
+        const nodeB = nodeMap.get(b)
+
+        if (sectionPosition && nodeA?.kind !== nodeB?.kind) {
+          if (nodeA?.kind === NODE_KIND_SECTION) {
+            return sectionPosition === 'first' ? -1 : 1
+          }
+          return sectionPosition === 'first' ? 1 : -1
+        }
+
+        const titleA = nodeA?.title ?? ''
+        const titleB = nodeB?.title ?? ''
         return direction === 'asc'
           ? titleA.localeCompare(titleB)
           : titleB.localeCompare(titleA)
@@ -161,19 +183,28 @@ export function SortPagesDialog({ parent }: { parent: PageNode }) {
     )
   }
 
+  const sortAlphabetically = (direction: 'asc' | 'desc') => {
+    setSortDirection(direction)
+    applySort(direction)
+  }
+
+  const sortBySectionPosition = (position: 'first' | 'last') => {
+    applySort(sortDirection, position)
+  }
+
   const handleSave = async (): Promise<boolean> => {
     setLoading(true)
     try {
       await sortPages(parent.id, order)
       await reloadTree()
-      toast.success(`${itemLabelCapitalized} children sorted successfully`)
+      toast.success(t('sortDialog.sortedToast', { item: itemLabelCapitalized }))
       return true
     } catch (err) {
       console.warn(err)
       handleFieldErrors(
         err,
         setFieldErrors,
-        `Error sorting ${itemLabel} children`,
+        t('sortDialog.sortErrorFallback', { item: itemLabel }),
       )
       return false
     } finally {
@@ -185,8 +216,8 @@ export function SortPagesDialog({ parent }: { parent: PageNode }) {
     <BaseDialog
       dialogType={DIALOG_SORT_PAGES}
       testidPrefix="sort-pages-dialog"
-      dialogTitle={`Sort ${itemLabelCapitalized} Children`}
-      dialogDescription={`Drag items to reorder, use the arrows, or sort alphabetically. Changes are saved after clicking 'Save'.`}
+      dialogTitle={t('sortDialog.title', { item: itemLabelCapitalized })}
+      dialogDescription={t('sortDialog.description')}
       onClose={() => true}
       onConfirm={async (type) => {
         if (type === 'confirm') {
@@ -195,14 +226,14 @@ export function SortPagesDialog({ parent }: { parent: PageNode }) {
         return false
       }}
       cancelButton={{
-        label: 'Cancel',
+        label: t('common.cancel'),
         variant: 'outline',
         autoFocus: false,
         disabled: loading,
       }}
       buttons={[
         {
-          label: 'Save',
+          label: t('sortDialog.save'),
           actionType: 'confirm',
           disabled: loading,
           variant: 'default',
@@ -212,7 +243,7 @@ export function SortPagesDialog({ parent }: { parent: PageNode }) {
     >
       <div className="sort-pages-dialog__toolbar">
         <span className="sort-pages-dialog__toolbar-label">
-          Sort alphabetically:
+          {t('sortDialog.sortAlphabetically')}
         </span>
         <Button
           variant="outline"
@@ -220,7 +251,7 @@ export function SortPagesDialog({ parent }: { parent: PageNode }) {
           data-testid="sort-az-button"
           onClick={() => sortAlphabetically('asc')}
         >
-          A → Z
+          {t('sortDialog.ascending')}
         </Button>
         <Button
           variant="outline"
@@ -228,7 +259,28 @@ export function SortPagesDialog({ parent }: { parent: PageNode }) {
           data-testid="sort-za-button"
           onClick={() => sortAlphabetically('desc')}
         >
-          Z → A
+          {t('sortDialog.descending')}
+        </Button>
+      </div>
+      <div className="sort-pages-dialog__toolbar">
+        <span className="sort-pages-dialog__toolbar-label">
+          {t('sortDialog.sortSections')}
+        </span>
+        <Button
+          variant="outline"
+          size="sm"
+          data-testid="sort-sections-first-button"
+          onClick={() => sortBySectionPosition('first')}
+        >
+          {t('sortDialog.sectionsFirst')}
+        </Button>
+        <Button
+          variant="outline"
+          size="sm"
+          data-testid="sort-sections-last-button"
+          onClick={() => sortBySectionPosition('last')}
+        >
+          {t('sortDialog.sectionsLast')}
         </Button>
       </div>
       <DndContext
@@ -256,6 +308,7 @@ export function SortPagesDialog({ parent }: { parent: PageNode }) {
                   index={i}
                   total={order.length}
                   onMove={move}
+                  dragHandleLabel={t('sortDialog.dragToReorder')}
                 />
               )
             })}

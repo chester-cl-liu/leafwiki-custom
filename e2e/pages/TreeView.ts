@@ -1,4 +1,4 @@
-import { expect, Page } from '@playwright/test';
+import { expect, Locator, Page } from '@playwright/test';
 import AddPageDialog from './AddPageDialog';
 import MovePageDialog from './MovePageDialog';
 import SortPageDialog from './SortPageDialog';
@@ -43,7 +43,8 @@ export default class TreeView {
     expectedActionTestId:
       | 'tree-view-action-button-sort'
       | 'tree-view-action-button-move'
-      | 'tree-view-action-button-delete',
+      | 'tree-view-action-button-delete'
+      | 'tree-view-action-button-rename',
   ) {
     await nodeRow.waitFor({ state: 'visible' });
     await nodeRow.scrollIntoViewIfNeeded();
@@ -117,7 +118,7 @@ export default class TreeView {
   }
 
   async isSidebarVisible(): Promise<boolean> {
-    return this.page.getByTestId('sidebar').isVisible();
+    return this.treeView().isVisible();
   }
 
   async getNumberOfTreeNodes() {
@@ -152,6 +153,60 @@ export default class TreeView {
       await expect.poll(() => new URL(this.page.url()).pathname).toBe(expectedPath);
     }
     await this.page.locator('article').waitFor({ state: 'visible' });
+  }
+
+  async clickNodeTitle(title: string, options?: Parameters<Locator['click']>[0]) {
+    await this.ensureSidebarVisible();
+    await this.closeBlockingOverlayIfPresent();
+    const nodeLink = await this.findPageByTitle(title);
+    await nodeLink.waitFor({ state: 'visible' });
+    await nodeLink.scrollIntoViewIfNeeded();
+    if (options?.button === 'middle' || options?.modifiers?.length) {
+      const modifiers = new Set(options.modifiers ?? []);
+      await nodeLink.dispatchEvent(options.button === 'middle' ? 'auxclick' : 'click', {
+        button: options.button === 'middle' ? 1 : 0,
+        ctrlKey: modifiers.has('Control'),
+        metaKey: modifiers.has('Meta'),
+        shiftKey: modifiers.has('Shift'),
+        altKey: modifiers.has('Alt'),
+      });
+      return;
+    }
+
+    await nodeLink.evaluate((element) => {
+      if (!(element instanceof HTMLElement)) {
+        throw new Error('Expected HTMLElement');
+      }
+
+      element.click();
+    });
+  }
+
+  async expectNodeExpanded(title: string, expanded: boolean) {
+    await this.ensureSidebarVisible();
+    const nodeRow = this.getNodeRowByTitle(title);
+    const childContainer = nodeRow.locator(
+      'xpath=following-sibling::div[contains(@class,"tree-node__children")][1]',
+    );
+
+    if (expanded) {
+      await expect(childContainer).not.toHaveClass(/tree-node__children--closed/);
+    } else {
+      await expect(childContainer).toHaveClass(/tree-node__children--closed/);
+    }
+  }
+
+  async clickNodeChevron(title: string) {
+    await this.ensureSidebarVisible();
+    const nodeRow = this.getNodeRowByTitle(title);
+    await nodeRow.waitFor({ state: 'visible' });
+    await nodeRow.locator('svg[data-testid^="tree-node-toggle-icon-"]').evaluate((element) => {
+      if (!(element instanceof SVGElement)) {
+        throw new Error('Expected SVGElement');
+      }
+
+      element.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    });
   }
 
   async expandNodeByTitle(title: string) {
@@ -249,6 +304,24 @@ export default class TreeView {
     );
     await expect(moveButton).toBeVisible();
     await moveButton.click();
+  }
+
+  async openRenameDialogForPage(pageTitle: string, parentPage?: string) {
+    await this.ensureSidebarVisible();
+    await this.closeBlockingOverlayIfPresent();
+
+    if (parentPage) {
+      await this.expandNodeByTitle(parentPage);
+    }
+
+    const nodeRow = this.getNodeRowByTitle(pageTitle);
+    await this.openMoreActionsMenuForNodeRow(nodeRow, 'tree-view-action-button-rename');
+
+    const renameButton = this.page.locator(
+      '[role="menuitem"][data-testid="tree-view-action-button-rename"]',
+    );
+    await expect(renameButton).toBeVisible();
+    await renameButton.click();
   }
 
   async openDeleteDialogForPage(pageTitle: string, parentPage?: string) {

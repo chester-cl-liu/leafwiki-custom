@@ -1,7 +1,10 @@
+import i18next from '@/lib/i18n'
 import { useConfigStore } from '@/stores/config'
 import { useSessionStore } from '@/stores/session'
 import { API_BASE_URL } from '../config'
 import { ApiLocalizedError, isApiLocalizedErrorResponse } from './errors'
+
+const t = (key: string) => i18next.t(key, { ns: 'auth' })
 
 export type AuthResponse = {
   accessTokenExpiresAt: number
@@ -11,7 +14,25 @@ export type AuthResponse = {
     username: string
     email: string
     role: 'admin' | 'editor' | 'viewer'
+    totpEnabled: boolean
   }
+}
+
+// Returned by POST /api/auth/login instead of AuthResponse when the account
+// has TOTP enabled: password was correct, but no cookies are set yet. Call
+// completeTOTPLogin with loginChallengeToken and a TOTP or recovery code to
+// finish logging in.
+export type LoginChallenge = {
+  requiresTotp: true
+  loginChallengeToken: string
+}
+
+function isLoginChallenge(data: unknown): data is LoginChallenge {
+  return (
+    !!data &&
+    typeof data === 'object' &&
+    (data as { requiresTotp?: unknown }).requiresTotp === true
+  )
 }
 
 const REFRESH_TIMEOUT_MS = 15000
@@ -53,12 +74,12 @@ export async function fetchMe(): Promise<AuthResponse['user'] | null> {
   return user ?? null
 }
 
-export async function login(identifier: string, password: string) {
-  const res = await fetch(`${API_BASE_URL}/api/auth/login`, {
+async function postLoginRequest<T>(path: string, body: object): Promise<T> {
+  const res = await fetch(`${API_BASE_URL}${path}`, {
     method: 'POST',
     credentials: 'include',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ identifier, password }),
+    body: JSON.stringify(body),
   })
 
   if (!res.ok) {
@@ -66,11 +87,23 @@ export async function login(identifier: string, password: string) {
     try {
       errorBody = await res.json()
     } catch {
-      throw new Error('Login failed')
+      throw new Error(t('login.errorFallback'))
     }
 
     if (isApiLocalizedErrorResponse(errorBody)) {
       throw new ApiLocalizedError(errorBody.error)
+    }
+
+    // Field-validation errors use their own body shape
+    // ({ error: 'validation_error', fields: [...] }) — re-throw it untouched
+    // so callers can surface per-field messages instead of the literal
+    // string "validation_error". Mirrors fetchWithAuth's handling.
+    if (
+      errorBody &&
+      typeof errorBody === 'object' &&
+      (errorBody as { error?: unknown }).error === 'validation_error'
+    ) {
+      throw errorBody
     }
 
     if (
@@ -81,15 +114,89 @@ export async function login(identifier: string, password: string) {
       throw new Error((errorBody as { error: string }).error)
     }
 
-    throw new Error('Login failed')
+    throw new Error(t('login.errorFallback'))
   }
 
-  const data: AuthResponse = await res.json()
+  return (await res.json()) as T
+}
 
+function applyAuthResponse(data: AuthResponse) {
   const { setAccessTokenExpiresAt, setUser } = useSessionStore.getState()
   setAccessTokenExpiresAt(data.accessTokenExpiresAt)
   setUser(data.user)
+}
 
+export async function login(
+  identifier: string,
+  password: string,
+): Promise<AuthResponse | LoginChallenge> {
+  const data = await postLoginRequest<AuthResponse | LoginChallenge>(
+    '/api/auth/login',
+    { identifier, password },
+  )
+
+  if (isLoginChallenge(data)) {
+    return data
+  }
+
+  applyAuthResponse(data)
+  return data
+}
+
+// completeTOTPLogin finishes a login handshake started by login() when the
+// account has TOTP enabled: code is either a current TOTP code or an unused
+// recovery code. Only on success are cookies set.
+export async function completeTOTPLogin(
+  loginChallengeToken: string,
+  code: string,
+): Promise<AuthResponse> {
+  const data = await postLoginRequest<AuthResponse>('/api/auth/login/totp', {
+    loginChallengeToken,
+    code,
+  })
+  applyAuthResponse(data)
+  return data
+}
+
+// requestPasswordReset always resolves (never throws for an unknown
+// identifier) — the backend deliberately returns the same response either
+// way, so the UI must not try to distinguish "sent" from "no such user".
+export async function requestPasswordReset(identifier: string): Promise<void> {
+  await postLoginRequest<{ message: string }>('/api/auth/password/forgot', {
+    identifier,
+  })
+}
+
+export type PasswordResetConfirmResponse = {
+  user: AuthResponse['user']
+}
+
+// confirmPasswordReset does NOT log the user in — a reset revokes every
+// existing session for the account (see the backend's
+// ConfirmPasswordResetUseCase), so the frontend sends the user to the login
+// page afterward instead of calling applyAuthResponse.
+export async function confirmPasswordReset(
+  token: string,
+  newPassword: string,
+): Promise<PasswordResetConfirmResponse> {
+  return postLoginRequest<PasswordResetConfirmResponse>(
+    '/api/auth/password/reset',
+    { token, newPassword },
+  )
+}
+
+// acceptInvite sets the invited user's real password and, unlike
+// confirmPasswordReset, logs them straight in — a freshly invited user has
+// no prior session to worry about (see the backend's ConfirmInviteUseCase).
+export async function acceptInvite(
+  token: string,
+  newPassword: string,
+): Promise<AuthResponse> {
+  const data = await postLoginRequest<AuthResponse>('/api/auth/invite/accept', {
+    token,
+    newPassword,
+  })
+  applyAuthResponse(data)
   return data
 }
 
@@ -117,6 +224,7 @@ export async function fetchWithAuth(
   const config = useConfigStore.getState()
   const authDisabled = config.authDisabled
   const httpRemoteUserEnabled = config.httpRemoteUserEnabled
+  const configLoadSucceeded = config.configLoadSucceeded
 
   const headers = new Headers(options.headers || {})
   if (!(options.body instanceof FormData)) {
@@ -160,8 +268,19 @@ export async function fetchWithAuth(
     try {
       await ensureRefresh()
     } catch {
-      await clearSessionState(sessionLogout)
-      throw new Error('Unauthorized')
+      // A refresh failure only proves the session is really gone once the
+      // auth mode is confirmed (configLoadSucceeded) — otherwise this could
+      // just as easily be a header-auth deployment whose refresh-token call
+      // was always going to 422 (accessTokenExpiresAt is never set in that
+      // mode, so the check above fires on every request). Forcing this
+      // request to fail on that guess — instead of letting the real request
+      // decide, the same way it already does when httpRemoteUserEnabled is
+      // *confirmed* true — is what caused GitHub #1407 (spurious
+      // CSRF-token-missing logouts, autosave breaking mid-edit).
+      if (configLoadSucceeded) {
+        await clearSessionState(sessionLogout)
+        throw new Error(t('apiErrors.unauthorized'))
+      }
     }
   }
 
@@ -172,8 +291,14 @@ export async function fetchWithAuth(
       await ensureRefresh()
       res = await doFetch()
     } catch {
-      await clearSessionState(sessionLogout)
-      throw new Error('Unauthorized')
+      if (configLoadSucceeded) {
+        await clearSessionState(sessionLogout)
+        throw new Error(t('apiErrors.unauthorized'))
+      }
+      // Unconfirmed mode: don't force a logout, but don't fabricate success
+      // either — `res` still holds the original 401 from above, so it falls
+      // through to the generic !res.ok handling below and surfaces as a
+      // normal error instead of a silent retry loop.
     }
   }
 
@@ -183,7 +308,7 @@ export async function fetchWithAuth(
     try {
       errorBody = errorText ? JSON.parse(errorText) : null
     } catch {
-      throw new ApiError(errorText || 'Request failed', res.status)
+      throw new ApiError(errorText || t('apiErrors.requestFailed'), res.status)
     }
 
     if (
@@ -214,7 +339,7 @@ export async function fetchWithAuth(
       throw new ApiError((errorBody as { message: string }).message, res.status)
     }
 
-    throw new ApiError('Request failed', res.status)
+    throw new ApiError(t('apiErrors.requestFailed'), res.status)
   }
 
   try {
@@ -255,8 +380,18 @@ async function clearSessionState(sessionLogout: () => Promise<void>) {
 }
 
 export function ensureRefresh(): Promise<void> {
-  const { authDisabled } = useConfigStore.getState()
-  if (authDisabled) {
+  const { authDisabled, httpRemoteUserEnabled } = useConfigStore.getState()
+  // Session-token refresh only applies to session/JWT auth — skip it
+  // whenever that's confirmed false, instead of relying on every caller to
+  // have already checked httpRemoteUserEnabled itself. Deliberately NOT
+  // gated on configLoadSucceeded: attempting a refresh while the auth mode
+  // is still unconfirmed is harmless by itself (worst case one wasted call),
+  // and skipping it here entirely would permanently disable refresh for
+  // session-auth deployments that hit one bad /api/config fetch. The actual
+  // risk — treating an unconfirmed-mode refresh failure as confirmed
+  // unauthorized and forcing a logout — is guarded at the reaction site in
+  // fetchWithAuth instead, not here.
+  if (authDisabled || httpRemoteUserEnabled) {
     return Promise.resolve()
   }
 
@@ -284,7 +419,7 @@ async function refreshAccessToken() {
     })
 
     if (!res.ok) {
-      throw new ApiError('Refresh failed', res.status)
+      throw new ApiError(t('apiErrors.refreshFailed'), res.status)
     }
 
     const data: AuthResponse = await res.json()
@@ -292,7 +427,7 @@ async function refreshAccessToken() {
     store.setUser(data.user)
   } catch (error) {
     if (error instanceof DOMException && error.name === 'AbortError') {
-      throw new Error('Refresh timed out')
+      throw new Error(t('apiErrors.refreshTimedOut'))
     }
 
     throw error

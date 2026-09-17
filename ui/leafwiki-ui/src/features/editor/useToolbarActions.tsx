@@ -13,7 +13,8 @@ import type { EditorView } from '@codemirror/view'
 import { completionStatus } from '@codemirror/autocomplete'
 import { Save, X, Cloud } from 'lucide-react'
 import { useEffect } from 'react'
-import { useEditorStore } from '@/stores/editor'
+import { useTranslation } from 'react-i18next'
+import { useUserSettingsStore } from '@/stores/userSettings'
 import { useIsMobile } from '@/lib/useIsMobile'
 import { type ToolbarButton, useToolbarStore } from '../toolbar/toolbarStore'
 import { usePageEditorStore } from './pageEditorStore'
@@ -41,6 +42,7 @@ export function useToolbarActions({
   insertHeading,
   getEditorView,
 }: ToolbarActionsOptions) {
+  const { t } = useTranslation('editor')
   const setButtons = useToolbarStore((state) => state.setButtons)
   const appMode = useAppMode()
   const readOnlyMode = useIsReadOnly()
@@ -49,8 +51,8 @@ export function useToolbarActions({
   const unregisterHotkey = useHotKeysStore((s) => s.unregisterHotkey)
 
   const dirty = usePageEditorStore(isDirtyState)
-  const autoSave = useEditorStore((s) => s.autoSave)
-  const toggleAutoSave = useEditorStore((s) => s.toggleAutoSave)
+  const autoSave = useUserSettingsStore((s) => s.autoSave)
+  const toggleAutoSave = useUserSettingsStore((s) => s.toggleAutoSave)
   const isMacOS =
     typeof navigator !== 'undefined' &&
     /Mac|iPhone|iPad|iPod/.test(navigator.platform)
@@ -65,7 +67,7 @@ export function useToolbarActions({
     const buttons: ToolbarButton[] = [
       {
         id: 'close-editor',
-        label: 'Close Editor',
+        label: t('toolbar.closeEditorButton'),
         hotkey: getShortcutDisplayLabel('editor.page.close', isMacOS),
         icon: <X size={18} />,
         action: closePage,
@@ -74,7 +76,7 @@ export function useToolbarActions({
       },
       {
         id: 'save-page',
-        label: 'Save Page',
+        label: t('toolbar.savePageButton'),
         hotkey: getShortcutDisplayLabel('editor.page.save', isMacOS),
         icon: <Save size={18} />,
         variant: 'default',
@@ -87,7 +89,7 @@ export function useToolbarActions({
     if (!isMobile) {
       buttons.push({
         id: 'toggle-auto-save',
-        label: 'Auto-save',
+        label: t('toolbar.autoSave'),
         hotkey: '',
         icon: <Cloud size={18} />,
         variant: 'outline',
@@ -109,6 +111,7 @@ export function useToolbarActions({
     autoSave,
     toggleAutoSave,
     isMacOS,
+    t,
   ])
 
   // Register hotkeys

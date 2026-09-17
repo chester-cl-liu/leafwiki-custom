@@ -11,8 +11,8 @@ import (
 	"github.com/perber/wiki/internal/core/tree"
 	"github.com/perber/wiki/internal/importer"
 	"github.com/perber/wiki/internal/properties"
-	"github.com/perber/wiki/internal/test_utils"
 	"github.com/perber/wiki/internal/tags"
+	"github.com/perber/wiki/internal/test_utils"
 	"github.com/perber/wiki/internal/wiki"
 )
 
@@ -69,7 +69,7 @@ func newTestWiki(t *testing.T) *wiki.Wiki {
 	t.Helper()
 	w, err := wiki.NewWiki(&wiki.WikiOptions{
 		StorageDir:          t.TempDir(),
-		AdminPassword:       "admin",
+		AdminPassword:       "adminpassword",
 		JWTSecret:           "secretkey",
 		AccessTokenTimeout:  15 * time.Minute,
 		RefreshTokenTimeout: 7 * 24 * time.Hour,
@@ -82,7 +82,7 @@ func newTestWiki(t *testing.T) *wiki.Wiki {
 
 func newTestImporterService(t *testing.T, w *wiki.Wiki) *importer.ImporterService {
 	t.Helper()
-	planner := importer.NewPlanner(wiki.NewWikiImportAdapter(w), tree.NewSlugService())
+	planner := importer.NewPlanner(wiki.NewWikiImportAdapter(w), tree.NewSlugService(), "")
 	importerDir := filepath.Join(w.GetStorageDir(), ".importer")
 	return importer.NewImporterService(
 		planner,
@@ -275,7 +275,7 @@ func TestImporterService_ExecuteCurrentPlan_RewritesLinksAndUploadsAssetsToDisk(
 	for _, expected := range []string{
 		"[Guide Home](/guides)",
 		"[API](/reference/endpoints#intro)",
-		"[API Alias](/reference/endpoints)",
+		"[[reference/endpoints|API Alias]]",
 		"/assets/" + setupPage.ID + "/logo.png",
 		"/assets/" + setupPage.ID + "/manual.pdf",
 	} {
@@ -322,8 +322,8 @@ func TestImporterService_ExecuteCurrentPlan_ImportsFixturePackage(t *testing.T) 
 		"[Relative MD](/reference/endpoints)",
 		"[Absolute MD](/reference/endpoints)",
 		"[Container](/guides)",
-		"[Endpoints](/reference/endpoints)",
-		"[API Alias](/reference/endpoints)",
+		"[[reference/endpoints]]",
+		"[[reference/endpoints|API Alias]]",
 		"![Relative Image](/assets/" + setupPage.ID + "/logo.png)",
 		"[Manual](/assets/" + setupPage.ID + "/manual.pdf)",
 		"![logo.png](/assets/" + setupPage.ID + "/logo.png)",
@@ -401,7 +401,7 @@ func TestImporterService_ExecuteCurrentPlan_ImportsLeafWikiNestedFixture(t *test
 
 	for _, expected := range []string{
 		"[Getting Started](/docs/getting-started)",
-		"[Basic Guide](/docs/guides/basic-guide)",
+		"[[docs/guides/basic-guide|Basic Guide]]",
 	} {
 		if !strings.Contains(introPage.Content, expected) {
 			t.Fatalf("expected intro content to contain %q, got:\n%s", expected, introPage.Content)
@@ -513,10 +513,10 @@ func TestImporterService_ExecuteCurrentPlan_ImportsObsidianWikiLinksFixture(t *t
 	}
 
 	for _, expected := range []string{
-		"[Project Plan](/project-plan)",
-		"[Brainstorm](/daily/brainstorm)",
+		"[[Project Plan]]",
+		"[[Brainstorm]]",
 		"[[Meeting Notes]]",
-		"[Meeting Alias](/daily/meeting-notes)",
+		"[[daily/meeting-notes|Meeting Alias]]",
 		"![diagram.png](/assets/" + homePage.ID + "/diagram.png)",
 		"`[[Project Plan]]`",
 		"[[Daily/Meeting Notes]]",
@@ -528,7 +528,7 @@ func TestImporterService_ExecuteCurrentPlan_ImportsObsidianWikiLinksFixture(t *t
 	}
 
 	for _, expected := range []string{
-		"[Meeting Notes](/daily/meeting-notes)",
+		"[[daily/meeting-notes]]",
 		"[Home](/home)",
 	} {
 		if !strings.Contains(projectPlanPage.Content, expected) {
@@ -536,11 +536,11 @@ func TestImporterService_ExecuteCurrentPlan_ImportsObsidianWikiLinksFixture(t *t
 		}
 	}
 
-	if !strings.Contains(meetingNotesPage.Content, "[Home](/home)") {
-		t.Fatalf("expected meeting-notes content to contain rewritten home link, got:\n%s", meetingNotesPage.Content)
+	if !strings.Contains(meetingNotesPage.Content, "[[Home]]") {
+		t.Fatalf("expected meeting-notes content to contain home wikilink, got:\n%s", meetingNotesPage.Content)
 	}
-	if !strings.Contains(brainstormPage.Content, "[Home](/home)") {
-		t.Fatalf("expected brainstorm content to contain rewritten home link, got:\n%s", brainstormPage.Content)
+	if !strings.Contains(brainstormPage.Content, "[[Home]]") {
+		t.Fatalf("expected brainstorm content to contain home wikilink, got:\n%s", brainstormPage.Content)
 	}
 
 	assets, err := probe.ListAssets(homePage.ID)

@@ -1,3 +1,4 @@
+import i18next from '@/lib/i18n'
 import { fetchWithAuth } from './auth'
 
 export type Backlink = {
@@ -34,6 +35,23 @@ export type LinkStatusResult = {
 export async function fetchLinkStatus(
   pageId: string,
 ): Promise<LinkStatusResult> {
-  if (!pageId) throw new Error('Page ID is required')
+  if (!pageId)
+    throw new Error(i18next.t('backlinks.pageIdRequired', { ns: 'viewer' }))
   return (await fetchWithAuth(`/api/pages/${pageId}/links`)) as LinkStatusResult
+}
+
+export type BrokenLink = {
+  from_page_id: string
+  from_path: string
+  from_title: string
+
+  to_path: string
+}
+
+export type BrokenLinksResult = {
+  links: BrokenLink[]
+}
+
+export async function fetchBrokenLinks(): Promise<BrokenLinksResult> {
+  return (await fetchWithAuth('/api/links/broken')) as BrokenLinksResult
 }

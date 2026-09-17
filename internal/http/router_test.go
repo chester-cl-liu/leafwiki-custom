@@ -4,7 +4,9 @@ import (
 	"archive/zip"
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
+	"log/slog"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -19,8 +21,11 @@ import (
 	"github.com/perber/wiki/internal/core/revision"
 	"github.com/perber/wiki/internal/core/tree"
 	httpinternal "github.com/perber/wiki/internal/http"
+	httpmetrics "github.com/perber/wiki/internal/http/metrics"
+	"github.com/perber/wiki/internal/publicaccess"
 	"github.com/perber/wiki/internal/test_utils"
 	"github.com/perber/wiki/internal/wiki"
+	wikiinstancesettings "github.com/perber/wiki/internal/wiki/instancesettings"
 )
 
 func pageNodeKind() *tree.NodeKind {
@@ -35,7 +40,7 @@ func createWikiTestInstance(t *testing.T) *wiki.Wiki {
 func createWikiTestInstanceWithRevisionFlag(t *testing.T, enableRevision bool) *wiki.Wiki {
 	w, err := wiki.NewWiki(&wiki.WikiOptions{
 		StorageDir:          t.TempDir(),
-		AdminPassword:       "admin",
+		AdminPassword:       "adminpassword",
 		JWTSecret:           "secretkey",
 		AccessTokenTimeout:  15 * time.Minute,
 		RefreshTokenTimeout: 7 * 24 * time.Hour,
@@ -51,9 +56,23 @@ func createRouterTestInstance(w *wiki.Wiki, t *testing.T) *gin.Engine {
 	return createRouterTestInstanceWithMaxAssetUploadSize(w, t, assets.DefaultMaxUploadSizeBytes)
 }
 
+func createRouterTestInstanceWithMetricsEnabled(w *wiki.Wiki, t *testing.T) *gin.Engine {
+	return httpinternal.NewRouter(w.Registrars(), w.FrontendConfig(), httpinternal.RouterOptions{
+		PublicAccess:            publicaccess.NewEnvManaged(false),
+		InjectCodeInHeader:      "",
+		CustomStylesheet:        "",
+		AllowInsecure:           true,
+		AccessTokenTimeout:      15 * time.Minute,
+		RefreshTokenTimeout:     7 * 24 * time.Hour,
+		HideLinkMetadataSection: false,
+		MaxAssetUploadSizeBytes: assets.DefaultMaxUploadSizeBytes,
+		Metrics:                 httpmetrics.NewHTTPMetrics("test"),
+	})
+}
+
 func createRouterTestInstanceWithRevision(w *wiki.Wiki, t *testing.T) *gin.Engine {
 	return httpinternal.NewRouter(w.Registrars(), w.FrontendConfig(), httpinternal.RouterOptions{
-		PublicAccess:            false,
+		PublicAccess:            publicaccess.NewEnvManaged(false),
 		InjectCodeInHeader:      "",
 		CustomStylesheet:        "",
 		AllowInsecure:           true,
@@ -67,7 +86,7 @@ func createRouterTestInstanceWithRevision(w *wiki.Wiki, t *testing.T) *gin.Engin
 
 func createRouterTestInstanceWithMaxAssetUploadSize(w *wiki.Wiki, t *testing.T, maxAssetUploadSizeBytes int64) *gin.Engine {
 	return httpinternal.NewRouter(w.Registrars(), w.FrontendConfig(), httpinternal.RouterOptions{
-		PublicAccess:            false,
+		PublicAccess:            publicaccess.NewEnvManaged(false),
 		InjectCodeInHeader:      "",
 		CustomStylesheet:        "",
 		AllowInsecure:           true,
@@ -80,7 +99,7 @@ func createRouterTestInstanceWithMaxAssetUploadSize(w *wiki.Wiki, t *testing.T, 
 
 func createRouterTestInstanceWithAllowInsecure(w *wiki.Wiki, allowInsecure bool, t *testing.T) *gin.Engine {
 	return httpinternal.NewRouter(w.Registrars(), w.FrontendConfig(), httpinternal.RouterOptions{
-		PublicAccess:            false,
+		PublicAccess:            publicaccess.NewEnvManaged(false),
 		InjectCodeInHeader:      "",
 		CustomStylesheet:        "",
 		AllowInsecure:           allowInsecure,
@@ -93,7 +112,7 @@ func createRouterTestInstanceWithAllowInsecure(w *wiki.Wiki, allowInsecure bool,
 
 func authenticatedRequest(t *testing.T, router http.Handler, method, url string, body *strings.Reader) *httptest.ResponseRecorder {
 	// Login
-	loginBody := `{"identifier": "admin", "password": "admin"}`
+	loginBody := `{"identifier": "admin", "password": "adminpassword"}`
 	loginReq := httptest.NewRequest(http.MethodPost, "/api/auth/login", strings.NewReader(loginBody))
 	loginReq.Header.Set("Content-Type", "application/json")
 	loginRec := httptest.NewRecorder()
@@ -350,7 +369,7 @@ func uploadAssetViaAPI(t *testing.T, router http.Handler, pageID, filename, cont
 		t.Fatalf("Close(writer) failed: %v", err)
 	}
 
-	loginBody := `{"identifier": "admin", "password": "admin"}`
+	loginBody := `{"identifier": "admin", "password": "adminpassword"}`
 	loginReq := httptest.NewRequest(http.MethodPost, "/api/auth/login", strings.NewReader(loginBody))
 	loginReq.Header.Set("Content-Type", "application/json")
 	loginRec := httptest.NewRecorder()
@@ -446,6 +465,42 @@ func writePageMarkdownForTest(t *testing.T, w *wiki.Wiki, page *apiPage, raw str
 	}
 }
 
+// loginAdminAndGetCSRF logs in as the seeded test admin and returns the CSRF
+// token plus session cookies needed for a subsequent authenticated request —
+// shared by every branding-upload test below so each one only has to build
+// the multipart request it actually cares about.
+func loginAdminAndGetCSRF(t *testing.T, router http.Handler) (csrfToken string, cookies []*http.Cookie) {
+	t.Helper()
+
+	loginBody := `{"identifier": "admin", "password": "adminpassword"}`
+	loginReq := httptest.NewRequest(http.MethodPost, "/api/auth/login", strings.NewReader(loginBody))
+	loginReq.Header.Set("Content-Type", "application/json")
+	loginRec := httptest.NewRecorder()
+	router.ServeHTTP(loginRec, loginReq)
+
+	if loginRec.Code != http.StatusOK {
+		t.Fatalf("Expected 200 OK on login, got %d - %s", loginRec.Code, loginRec.Body.String())
+	}
+
+	loginRes := loginRec.Result()
+	defer test_utils.WrapCloseWithErrorCheck(loginRes.Body.Close, t)
+
+	cookies = loginRes.Cookies()
+	csrfToken = loginRec.Header().Get("X-CSRF-Token")
+	if csrfToken == "" {
+		for _, c := range cookies {
+			if c.Name == "leafwiki_csrf" || c.Name == "__Host-leafwiki_csrf" {
+				csrfToken = c.Value
+				break
+			}
+		}
+	}
+	if csrfToken == "" {
+		t.Fatal("Expected CSRF token after login, got none")
+	}
+	return csrfToken, cookies
+}
+
 func uploadBrandingLogoViaAPI(t *testing.T, router http.Handler, filename string, content []byte) {
 	t.Helper()
 
@@ -462,32 +517,7 @@ func uploadBrandingLogoViaAPI(t *testing.T, router http.Handler, filename string
 		t.Fatalf("Close(writer) failed: %v", err)
 	}
 
-	loginBody := `{"identifier": "admin", "password": "admin"}`
-	loginReq := httptest.NewRequest(http.MethodPost, "/api/auth/login", strings.NewReader(loginBody))
-	loginReq.Header.Set("Content-Type", "application/json")
-	loginRec := httptest.NewRecorder()
-	router.ServeHTTP(loginRec, loginReq)
-
-	if loginRec.Code != http.StatusOK {
-		t.Fatalf("Expected 200 OK on login, got %d - %s", loginRec.Code, loginRec.Body.String())
-	}
-
-	loginRes := loginRec.Result()
-	defer test_utils.WrapCloseWithErrorCheck(loginRes.Body.Close, t)
-
-	cookies := loginRes.Cookies()
-	csrfToken := loginRec.Header().Get("X-CSRF-Token")
-	if csrfToken == "" {
-		for _, c := range cookies {
-			if c.Name == "leafwiki_csrf" || c.Name == "__Host-leafwiki_csrf" {
-				csrfToken = c.Value
-				break
-			}
-		}
-	}
-	if csrfToken == "" {
-		t.Fatal("Expected CSRF token after login, got none")
-	}
+	csrfToken, cookies := loginAdminAndGetCSRF(t, router)
 
 	req := httptest.NewRequest(http.MethodPost, "/api/branding/logo", body)
 	req.Header.Set("Content-Type", writer.FormDataContentType())
@@ -520,32 +550,7 @@ func uploadBrandingFaviconViaAPI(t *testing.T, router http.Handler, filename str
 		t.Fatalf("Close(writer) failed: %v", err)
 	}
 
-	loginBody := `{"identifier": "admin", "password": "admin"}`
-	loginReq := httptest.NewRequest(http.MethodPost, "/api/auth/login", strings.NewReader(loginBody))
-	loginReq.Header.Set("Content-Type", "application/json")
-	loginRec := httptest.NewRecorder()
-	router.ServeHTTP(loginRec, loginReq)
-
-	if loginRec.Code != http.StatusOK {
-		t.Fatalf("Expected 200 OK on login, got %d - %s", loginRec.Code, loginRec.Body.String())
-	}
-
-	loginRes := loginRec.Result()
-	defer test_utils.WrapCloseWithErrorCheck(loginRes.Body.Close, t)
-
-	cookies := loginRes.Cookies()
-	csrfToken := loginRec.Header().Get("X-CSRF-Token")
-	if csrfToken == "" {
-		for _, c := range cookies {
-			if c.Name == "leafwiki_csrf" || c.Name == "__Host-leafwiki_csrf" {
-				csrfToken = c.Value
-				break
-			}
-		}
-	}
-	if csrfToken == "" {
-		t.Fatal("Expected CSRF token after login, got none")
-	}
+	csrfToken, cookies := loginAdminAndGetCSRF(t, router)
 
 	req := httptest.NewRequest(http.MethodPost, "/api/branding/favicon", body)
 	req.Header.Set("Content-Type", writer.FormDataContentType())
@@ -559,6 +564,185 @@ func uploadBrandingFaviconViaAPI(t *testing.T, router http.Handler, filename str
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("Expected 200 OK, got %d - %s", rec.Code, rec.Body.String())
+	}
+}
+
+// brandingErrorCode extracts the {"error":{"code": "..."}} field asserted by
+// the regression tests below, so each test body only has to state the code
+// it expects rather than re-deriving the response shape.
+func brandingErrorCode(t *testing.T, rec *httptest.ResponseRecorder) string {
+	t.Helper()
+
+	var resp struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to decode error response %q: %v", rec.Body.String(), err)
+	}
+	return resp.Error.Code
+}
+
+// The four tests below pin the pre-existing status code / error code
+// contract for branding logo/favicon upload's too-large and missing-file
+// cases (413/"branding_*_too_large", 400/"branding_*_missing"). They exist
+// specifically as a regression guard around internal/wiki/branding/routes.go
+// having been refactored onto the shared httpinternal.ParseUploadedFile
+// helper (see internal/http/upload.go) — before that refactor, nothing
+// exercised this error path at the HTTP layer at all, so a behavior change
+// here (wrong status, wrong code, or the check silently stopping working)
+// would have gone unnoticed.
+
+func TestBrandingUploadLogo_TooLarge_Returns413(t *testing.T) {
+	w := createWikiTestInstance(t)
+	defer test_utils.WrapCloseWithErrorCheck(w.Close, t)
+	router := createRouterTestInstance(w, t)
+
+	cfg, err := w.BrandingService().GetBranding()
+	if err != nil {
+		t.Fatalf("GetBranding failed: %v", err)
+	}
+	oversized := bytes.Repeat([]byte("a"), int(cfg.BrandingConstraints.MaxLogoSize)+1)
+
+	body := &bytes.Buffer{}
+	writer := multipart.NewWriter(body)
+	part, err := writer.CreateFormFile("file", "logo.png")
+	if err != nil {
+		t.Fatalf("CreateFormFile failed: %v", err)
+	}
+	if _, err := part.Write(oversized); err != nil {
+		t.Fatalf("Write(oversized logo) failed: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("Close(writer) failed: %v", err)
+	}
+
+	csrfToken, cookies := loginAdminAndGetCSRF(t, router)
+	req := httptest.NewRequest(http.MethodPost, "/api/branding/logo", body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.Header.Set("X-CSRF-Token", csrfToken)
+	for _, cookie := range cookies {
+		req.AddCookie(cookie)
+	}
+
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("Expected 413, got %d - %s", rec.Code, rec.Body.String())
+	}
+	if code := brandingErrorCode(t, rec); code != "branding_logo_too_large" {
+		t.Fatalf("Expected error code %q, got %q", "branding_logo_too_large", code)
+	}
+}
+
+func TestBrandingUploadLogo_MissingFile_Returns400(t *testing.T) {
+	w := createWikiTestInstance(t)
+	defer test_utils.WrapCloseWithErrorCheck(w.Close, t)
+	router := createRouterTestInstance(w, t)
+
+	body := &bytes.Buffer{}
+	writer := multipart.NewWriter(body)
+	if err := writer.WriteField("notFile", "irrelevant"); err != nil {
+		t.Fatalf("WriteField failed: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("Close(writer) failed: %v", err)
+	}
+
+	csrfToken, cookies := loginAdminAndGetCSRF(t, router)
+	req := httptest.NewRequest(http.MethodPost, "/api/branding/logo", body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.Header.Set("X-CSRF-Token", csrfToken)
+	for _, cookie := range cookies {
+		req.AddCookie(cookie)
+	}
+
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("Expected 400, got %d - %s", rec.Code, rec.Body.String())
+	}
+	if code := brandingErrorCode(t, rec); code != "branding_logo_missing" {
+		t.Fatalf("Expected error code %q, got %q", "branding_logo_missing", code)
+	}
+}
+
+func TestBrandingUploadFavicon_TooLarge_Returns413(t *testing.T) {
+	w := createWikiTestInstance(t)
+	defer test_utils.WrapCloseWithErrorCheck(w.Close, t)
+	router := createRouterTestInstance(w, t)
+
+	cfg, err := w.BrandingService().GetBranding()
+	if err != nil {
+		t.Fatalf("GetBranding failed: %v", err)
+	}
+	oversized := bytes.Repeat([]byte("a"), int(cfg.BrandingConstraints.MaxFaviconSize)+1)
+
+	body := &bytes.Buffer{}
+	writer := multipart.NewWriter(body)
+	part, err := writer.CreateFormFile("file", "favicon.ico")
+	if err != nil {
+		t.Fatalf("CreateFormFile failed: %v", err)
+	}
+	if _, err := part.Write(oversized); err != nil {
+		t.Fatalf("Write(oversized favicon) failed: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("Close(writer) failed: %v", err)
+	}
+
+	csrfToken, cookies := loginAdminAndGetCSRF(t, router)
+	req := httptest.NewRequest(http.MethodPost, "/api/branding/favicon", body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.Header.Set("X-CSRF-Token", csrfToken)
+	for _, cookie := range cookies {
+		req.AddCookie(cookie)
+	}
+
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("Expected 413, got %d - %s", rec.Code, rec.Body.String())
+	}
+	if code := brandingErrorCode(t, rec); code != "branding_favicon_too_large" {
+		t.Fatalf("Expected error code %q, got %q", "branding_favicon_too_large", code)
+	}
+}
+
+func TestBrandingUploadFavicon_MissingFile_Returns400(t *testing.T) {
+	w := createWikiTestInstance(t)
+	defer test_utils.WrapCloseWithErrorCheck(w.Close, t)
+	router := createRouterTestInstance(w, t)
+
+	body := &bytes.Buffer{}
+	writer := multipart.NewWriter(body)
+	if err := writer.WriteField("notFile", "irrelevant"); err != nil {
+		t.Fatalf("WriteField failed: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("Close(writer) failed: %v", err)
+	}
+
+	csrfToken, cookies := loginAdminAndGetCSRF(t, router)
+	req := httptest.NewRequest(http.MethodPost, "/api/branding/favicon", body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.Header.Set("X-CSRF-Token", csrfToken)
+	for _, cookie := range cookies {
+		req.AddCookie(cookie)
+	}
+
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("Expected 400, got %d - %s", rec.Code, rec.Body.String())
+	}
+	if code := brandingErrorCode(t, rec); code != "branding_favicon_missing" {
+		t.Fatalf("Expected error code %q, got %q", "branding_favicon_missing", code)
 	}
 }
 
@@ -627,6 +811,34 @@ func TestDisableRequestLog_DoesNotCrash(t *testing.T) {
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestMetricsEndpoint_IsNotExposedOnAppRouterByDefault(t *testing.T) {
+	w := createWikiTestInstance(t)
+	defer test_utils.WrapCloseWithErrorCheck(w.Close, t)
+	router := createRouterTestInstance(w, t)
+
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 from disabled /metrics endpoint, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestMetricsEndpoint_IsNotExposedOnAppRouterWhenMetricsEnabled(t *testing.T) {
+	w := createWikiTestInstance(t)
+	defer test_utils.WrapCloseWithErrorCheck(w.Close, t)
+	router := createRouterTestInstanceWithMetricsEnabled(w, t)
+
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 from app router /metrics endpoint, got %d: %s", rec.Code, rec.Body.String())
 	}
 }
 
@@ -756,7 +968,7 @@ func TestLoginEndpoint_ExplainsAllowInsecureRequirementOnHTTP(t *testing.T) {
 	defer test_utils.WrapCloseWithErrorCheck(w.Close, t)
 	router := createRouterTestInstanceWithAllowInsecure(w, false, t)
 
-	loginBody := `{"identifier": "admin", "password": "admin"}`
+	loginBody := `{"identifier": "admin", "password": "adminpassword"}`
 	req := httptest.NewRequest(http.MethodPost, "/api/auth/login", strings.NewReader(loginBody))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
@@ -856,7 +1068,7 @@ func TestConfigEndpoint_IncludesMaxAssetUploadSizeBytes(t *testing.T) {
 
 	const maxAssetUploadSizeBytes int64 = 123456
 	router := httpinternal.NewRouter(w.Registrars(), w.FrontendConfig(), httpinternal.RouterOptions{
-		PublicAccess:            true,
+		PublicAccess:            publicaccess.NewEnvManaged(true),
 		InjectCodeInHeader:      "",
 		AllowInsecure:           true,
 		AccessTokenTimeout:      15 * time.Minute,
@@ -893,7 +1105,7 @@ func TestConfigEndpoint_IncludesEnableLinkRefactor(t *testing.T) {
 	defer test_utils.WrapCloseWithErrorCheck(w.Close, t)
 
 	router := httpinternal.NewRouter(w.Registrars(), w.FrontendConfig(), httpinternal.RouterOptions{
-		PublicAccess:            true,
+		PublicAccess:            publicaccess.NewEnvManaged(true),
 		InjectCodeInHeader:      "",
 		AllowInsecure:           true,
 		AccessTokenTimeout:      15 * time.Minute,
@@ -926,12 +1138,398 @@ func TestConfigEndpoint_IncludesEnableLinkRefactor(t *testing.T) {
 	}
 }
 
+func TestConfigEndpoint_IncludesEnableAPIKeyManagement(t *testing.T) {
+	w := createWikiTestInstance(t)
+	defer test_utils.WrapCloseWithErrorCheck(w.Close, t)
+
+	router := httpinternal.NewRouter(w.Registrars(), w.FrontendConfig(), httpinternal.RouterOptions{
+		PublicAccess:            publicaccess.NewEnvManaged(true),
+		InjectCodeInHeader:      "",
+		AllowInsecure:           true,
+		AccessTokenTimeout:      15 * time.Minute,
+		RefreshTokenTimeout:     7 * 24 * time.Hour,
+		HideLinkMetadataSection: false,
+		MaxAssetUploadSizeBytes: assets.DefaultMaxUploadSizeBytes,
+		EnableAPIKeyManagement:  true,
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/config", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("Expected 200 OK, got %d", rec.Code)
+	}
+
+	var resp map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("Invalid JSON response: %v", err)
+	}
+
+	gotEnabled, ok := resp["enableApiKeyManagement"].(bool)
+	if !ok {
+		t.Fatalf("Expected enableApiKeyManagement in config response, got %v", resp)
+	}
+
+	if !gotEnabled {
+		t.Fatalf("Expected enableApiKeyManagement=true, got %v", gotEnabled)
+	}
+}
+
+func TestConfigEndpoint_EnableAPIKeyManagementDefaultsToFalse(t *testing.T) {
+	w := createWikiTestInstance(t)
+	defer test_utils.WrapCloseWithErrorCheck(w.Close, t)
+
+	router := httpinternal.NewRouter(w.Registrars(), w.FrontendConfig(), httpinternal.RouterOptions{
+		PublicAccess:            publicaccess.NewEnvManaged(true),
+		AllowInsecure:           true,
+		AccessTokenTimeout:      15 * time.Minute,
+		RefreshTokenTimeout:     7 * 24 * time.Hour,
+		MaxAssetUploadSizeBytes: assets.DefaultMaxUploadSizeBytes,
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/config", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("Expected 200 OK, got %d", rec.Code)
+	}
+
+	var resp map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("Invalid JSON response: %v", err)
+	}
+
+	gotEnabled, ok := resp["enableApiKeyManagement"].(bool)
+	if !ok {
+		t.Fatalf("Expected enableApiKeyManagement in config response, got %v", resp)
+	}
+
+	if gotEnabled {
+		t.Fatalf("Expected enableApiKeyManagement=false by default, got %v", gotEnabled)
+	}
+}
+
+func TestConfigEndpoint_IncludesTOTPAvailable(t *testing.T) {
+	w := createWikiTestInstance(t)
+	defer test_utils.WrapCloseWithErrorCheck(w.Close, t)
+
+	router := httpinternal.NewRouter(w.Registrars(), w.FrontendConfig(), httpinternal.RouterOptions{
+		PublicAccess:            publicaccess.NewEnvManaged(true),
+		InjectCodeInHeader:      "",
+		AllowInsecure:           true,
+		AccessTokenTimeout:      15 * time.Minute,
+		RefreshTokenTimeout:     7 * 24 * time.Hour,
+		HideLinkMetadataSection: false,
+		MaxAssetUploadSizeBytes: assets.DefaultMaxUploadSizeBytes,
+		TOTPAvailable:           true,
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/config", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("Expected 200 OK, got %d", rec.Code)
+	}
+
+	var resp map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("Invalid JSON response: %v", err)
+	}
+
+	gotAvailable, ok := resp["totpAvailable"].(bool)
+	if !ok {
+		t.Fatalf("Expected totpAvailable in config response, got %v", resp)
+	}
+
+	if !gotAvailable {
+		t.Fatalf("Expected totpAvailable=true, got %v", gotAvailable)
+	}
+}
+
+func TestConfigEndpoint_TOTPAvailableDefaultsToFalse(t *testing.T) {
+	w := createWikiTestInstance(t)
+	defer test_utils.WrapCloseWithErrorCheck(w.Close, t)
+
+	router := httpinternal.NewRouter(w.Registrars(), w.FrontendConfig(), httpinternal.RouterOptions{
+		PublicAccess:            publicaccess.NewEnvManaged(true),
+		AllowInsecure:           true,
+		AccessTokenTimeout:      15 * time.Minute,
+		RefreshTokenTimeout:     7 * 24 * time.Hour,
+		MaxAssetUploadSizeBytes: assets.DefaultMaxUploadSizeBytes,
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/config", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("Expected 200 OK, got %d", rec.Code)
+	}
+
+	var resp map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("Invalid JSON response: %v", err)
+	}
+
+	gotAvailable, ok := resp["totpAvailable"].(bool)
+	if !ok {
+		t.Fatalf("Expected totpAvailable in config response, got %v", resp)
+	}
+
+	if gotAvailable {
+		t.Fatalf("Expected totpAvailable=false by default, got %v", gotAvailable)
+	}
+}
+
+func TestConfigEndpoint_IncludesUserManagementUrl(t *testing.T) {
+	w := createWikiTestInstance(t)
+	defer test_utils.WrapCloseWithErrorCheck(w.Close, t)
+
+	router := httpinternal.NewRouter(w.Registrars(), w.FrontendConfig(), httpinternal.RouterOptions{
+		PublicAccess:            publicaccess.NewEnvManaged(true),
+		InjectCodeInHeader:      "",
+		AllowInsecure:           true,
+		AccessTokenTimeout:      15 * time.Minute,
+		RefreshTokenTimeout:     7 * 24 * time.Hour,
+		HideLinkMetadataSection: false,
+		MaxAssetUploadSizeBytes: assets.DefaultMaxUploadSizeBytes,
+		UserManagementURL:       "https://control-plane.example.com/users",
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/config", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("Expected 200 OK, got %d", rec.Code)
+	}
+
+	var resp map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("Invalid JSON response: %v", err)
+	}
+
+	got, ok := resp["userManagementUrl"].(string)
+	if !ok {
+		t.Fatalf("Expected userManagementUrl in config response, got %v", resp)
+	}
+
+	if got != "https://control-plane.example.com/users" {
+		t.Fatalf("Expected userManagementUrl=%q, got %q", "https://control-plane.example.com/users", got)
+	}
+}
+
+func TestConfigEndpoint_UserManagementUrlDefaultsToEmpty(t *testing.T) {
+	w := createWikiTestInstance(t)
+	defer test_utils.WrapCloseWithErrorCheck(w.Close, t)
+
+	router := httpinternal.NewRouter(w.Registrars(), w.FrontendConfig(), httpinternal.RouterOptions{
+		PublicAccess:            publicaccess.NewEnvManaged(true),
+		InjectCodeInHeader:      "",
+		AllowInsecure:           true,
+		AccessTokenTimeout:      15 * time.Minute,
+		RefreshTokenTimeout:     7 * 24 * time.Hour,
+		HideLinkMetadataSection: false,
+		MaxAssetUploadSizeBytes: assets.DefaultMaxUploadSizeBytes,
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/config", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("Expected 200 OK, got %d", rec.Code)
+	}
+
+	var resp map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("Invalid JSON response: %v", err)
+	}
+
+	got, ok := resp["userManagementUrl"].(string)
+	if !ok {
+		t.Fatalf("Expected userManagementUrl in config response, got %v", resp)
+	}
+
+	if got != "" {
+		t.Fatalf("Expected userManagementUrl to default to empty string, got %q", got)
+	}
+}
+
+func TestConfigEndpoint_IncludesLoginAndLogoutUrl(t *testing.T) {
+	w := createWikiTestInstance(t)
+	defer test_utils.WrapCloseWithErrorCheck(w.Close, t)
+
+	router := httpinternal.NewRouter(w.Registrars(), w.FrontendConfig(), httpinternal.RouterOptions{
+		PublicAccess:            publicaccess.NewEnvManaged(true),
+		InjectCodeInHeader:      "",
+		AllowInsecure:           true,
+		AccessTokenTimeout:      15 * time.Minute,
+		RefreshTokenTimeout:     7 * 24 * time.Hour,
+		HideLinkMetadataSection: false,
+		MaxAssetUploadSizeBytes: assets.DefaultMaxUploadSizeBytes,
+		LoginURL:                "https://idp.example.com/login",
+		LogoutURL:               "https://idp.example.com/logout",
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/config", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("Expected 200 OK, got %d", rec.Code)
+	}
+
+	var resp map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("Invalid JSON response: %v", err)
+	}
+
+	gotLogin, ok := resp["loginUrl"].(string)
+	if !ok {
+		t.Fatalf("Expected loginUrl in config response, got %v", resp)
+	}
+	if gotLogin != "https://idp.example.com/login" {
+		t.Fatalf("Expected loginUrl=%q, got %q", "https://idp.example.com/login", gotLogin)
+	}
+
+	gotLogout, ok := resp["logoutUrl"].(string)
+	if !ok {
+		t.Fatalf("Expected logoutUrl in config response, got %v", resp)
+	}
+	if gotLogout != "https://idp.example.com/logout" {
+		t.Fatalf("Expected logoutUrl=%q, got %q", "https://idp.example.com/logout", gotLogout)
+	}
+}
+
+func TestConfigEndpoint_LoginAndLogoutUrlDefaultToEmpty(t *testing.T) {
+	w := createWikiTestInstance(t)
+	defer test_utils.WrapCloseWithErrorCheck(w.Close, t)
+
+	router := httpinternal.NewRouter(w.Registrars(), w.FrontendConfig(), httpinternal.RouterOptions{
+		PublicAccess:            publicaccess.NewEnvManaged(true),
+		InjectCodeInHeader:      "",
+		AllowInsecure:           true,
+		AccessTokenTimeout:      15 * time.Minute,
+		RefreshTokenTimeout:     7 * 24 * time.Hour,
+		HideLinkMetadataSection: false,
+		MaxAssetUploadSizeBytes: assets.DefaultMaxUploadSizeBytes,
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/config", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("Expected 200 OK, got %d", rec.Code)
+	}
+
+	var resp map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("Invalid JSON response: %v", err)
+	}
+
+	gotLogin, ok := resp["loginUrl"].(string)
+	if !ok {
+		t.Fatalf("Expected loginUrl in config response, got %v", resp)
+	}
+	if gotLogin != "" {
+		t.Fatalf("Expected loginUrl to default to empty string, got %q", gotLogin)
+	}
+
+	gotLogout, ok := resp["logoutUrl"].(string)
+	if !ok {
+		t.Fatalf("Expected logoutUrl in config response, got %v", resp)
+	}
+	if gotLogout != "" {
+		t.Fatalf("Expected logoutUrl to default to empty string, got %q", gotLogout)
+	}
+}
+
+func TestConfigEndpoint_IncludesDefaultLanguage(t *testing.T) {
+	w := createWikiTestInstance(t)
+	defer test_utils.WrapCloseWithErrorCheck(w.Close, t)
+
+	router := httpinternal.NewRouter(w.Registrars(), w.FrontendConfig(), httpinternal.RouterOptions{
+		PublicAccess:            publicaccess.NewEnvManaged(true),
+		InjectCodeInHeader:      "",
+		AllowInsecure:           true,
+		AccessTokenTimeout:      15 * time.Minute,
+		RefreshTokenTimeout:     7 * 24 * time.Hour,
+		HideLinkMetadataSection: false,
+		MaxAssetUploadSizeBytes: assets.DefaultMaxUploadSizeBytes,
+		DefaultLanguage:         "de",
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/config", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("Expected 200 OK, got %d", rec.Code)
+	}
+
+	var resp map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("Invalid JSON response: %v", err)
+	}
+
+	got, ok := resp["defaultLanguage"].(string)
+	if !ok {
+		t.Fatalf("Expected defaultLanguage in config response, got %v", resp)
+	}
+
+	if got != "de" {
+		t.Fatalf("Expected defaultLanguage=%q, got %q", "de", got)
+	}
+}
+
+func TestConfigEndpoint_DefaultLanguageDefaultsToEmpty(t *testing.T) {
+	w := createWikiTestInstance(t)
+	defer test_utils.WrapCloseWithErrorCheck(w.Close, t)
+
+	router := httpinternal.NewRouter(w.Registrars(), w.FrontendConfig(), httpinternal.RouterOptions{
+		PublicAccess:            publicaccess.NewEnvManaged(true),
+		InjectCodeInHeader:      "",
+		AllowInsecure:           true,
+		AccessTokenTimeout:      15 * time.Minute,
+		RefreshTokenTimeout:     7 * 24 * time.Hour,
+		HideLinkMetadataSection: false,
+		MaxAssetUploadSizeBytes: assets.DefaultMaxUploadSizeBytes,
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/config", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("Expected 200 OK, got %d", rec.Code)
+	}
+
+	var resp map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("Invalid JSON response: %v", err)
+	}
+
+	got, ok := resp["defaultLanguage"].(string)
+	if !ok {
+		t.Fatalf("Expected defaultLanguage in config response, got %v", resp)
+	}
+
+	if got != "" {
+		t.Fatalf("Expected defaultLanguage to default to empty string, got %q", got)
+	}
+}
+
 func TestRefactorPreviewEndpoint_UsesFrontendJSONShape(t *testing.T) {
 	w := createWikiTestInstance(t)
 	defer test_utils.WrapCloseWithErrorCheck(w.Close, t)
 
 	router := httpinternal.NewRouter(w.Registrars(), w.FrontendConfig(), httpinternal.RouterOptions{
-		PublicAccess:            false,
+		PublicAccess:            publicaccess.NewEnvManaged(false),
 		InjectCodeInHeader:      "",
 		AllowInsecure:           true,
 		AccessTokenTimeout:      15 * time.Minute,
@@ -990,7 +1588,7 @@ func TestRefactorPreviewEndpoint_IsDisabledWhenFlagIsOff(t *testing.T) {
 	defer test_utils.WrapCloseWithErrorCheck(w.Close, t)
 
 	router := httpinternal.NewRouter(w.Registrars(), w.FrontendConfig(), httpinternal.RouterOptions{
-		PublicAccess:            false,
+		PublicAccess:            publicaccess.NewEnvManaged(false),
 		InjectCodeInHeader:      "",
 		AllowInsecure:           true,
 		AccessTokenTimeout:      15 * time.Minute,
@@ -1013,7 +1611,7 @@ func TestRefactorApply_DoesNotPersistRevisionsWhenRevisionDisabled(t *testing.T)
 	defer test_utils.WrapCloseWithErrorCheck(w.Close, t)
 
 	router := httpinternal.NewRouter(w.Registrars(), w.FrontendConfig(), httpinternal.RouterOptions{
-		PublicAccess:            false,
+		PublicAccess:            publicaccess.NewEnvManaged(false),
 		InjectCodeInHeader:      "",
 		AllowInsecure:           true,
 		AccessTokenTimeout:      15 * time.Minute,
@@ -1069,7 +1667,7 @@ func TestUploadAssetEndpoint_RejectsFilesExceedingConfiguredLimit(t *testing.T) 
 	defer test_utils.WrapCloseWithErrorCheck(w.Close, t)
 
 	router := httpinternal.NewRouter(w.Registrars(), w.FrontendConfig(), httpinternal.RouterOptions{
-		PublicAccess:            false,
+		PublicAccess:            publicaccess.NewEnvManaged(false),
 		InjectCodeInHeader:      "",
 		AllowInsecure:           true,
 		AccessTokenTimeout:      15 * time.Minute,
@@ -1080,7 +1678,7 @@ func TestUploadAssetEndpoint_RejectsFilesExceedingConfiguredLimit(t *testing.T) 
 
 	page := createPageViaAPI(t, router, "Asset Limit Test", "asset-limit-test", nil, pageNodeKind())
 
-	loginBody := `{"identifier": "admin", "password": "admin"}`
+	loginBody := `{"identifier": "admin", "password": "adminpassword"}`
 	loginReq := httptest.NewRequest(http.MethodPost, "/api/auth/login", strings.NewReader(loginBody))
 	loginReq.Header.Set("Content-Type", "application/json")
 	loginRec := httptest.NewRecorder()
@@ -1194,7 +1792,7 @@ func TestCancelImportPlanEndpoint(t *testing.T) {
 		t.Fatalf("Close multipart writer failed: %v", err)
 	}
 
-	loginBody := `{"identifier": "admin", "password": "admin"}`
+	loginBody := `{"identifier": "admin", "password": "adminpassword"}`
 	loginReq := httptest.NewRequest(http.MethodPost, "/api/auth/login", strings.NewReader(loginBody))
 	loginReq.Header.Set("Content-Type", "application/json")
 	loginRec := httptest.NewRecorder()
@@ -1281,7 +1879,7 @@ func TestImportExecuteEndpoint_WithZipUpload_ImportsPagesLinksAndAssets(t *testi
 	fixtureDir := importerFixturePathForHTTPTests(t, "link-assets-package")
 	zipBytes := createZipFromDir(t, fixtureDir)
 
-	loginBody := `{"identifier": "admin", "password": "admin"}`
+	loginBody := `{"identifier": "admin", "password": "adminpassword"}`
 	loginReq := httptest.NewRequest(http.MethodPost, "/api/auth/login", strings.NewReader(loginBody))
 	loginReq.Header.Set("Content-Type", "application/json")
 	loginRec := httptest.NewRecorder()
@@ -1427,8 +2025,8 @@ func TestImportExecuteEndpoint_WithZipUpload_ImportsPagesLinksAndAssets(t *testi
 		"[Relative MD](/reference/endpoints)",
 		"[Absolute MD](/reference/endpoints)",
 		"[Container](/guides)",
-		"[Endpoints](/reference/endpoints)",
-		"[API Alias](/reference/endpoints)",
+		"[[reference/endpoints]]",
+		"[[reference/endpoints|API Alias]]",
 		"![Relative Image](/assets/" + setupPage.ID + "/logo.png)",
 		"[Manual](/assets/" + setupPage.ID + "/manual.pdf)",
 	} {
@@ -1462,7 +2060,7 @@ func TestImportExecuteEndpoint_UsesConfiguredAssetUploadLimit(t *testing.T) {
 
 	zipBytes := createZipFromDir(t, fixtureDir)
 
-	loginBody := `{"identifier": "admin", "password": "admin"}`
+	loginBody := `{"identifier": "admin", "password": "adminpassword"}`
 	loginReq := httptest.NewRequest(http.MethodPost, "/api/auth/login", strings.NewReader(loginBody))
 	loginReq.Header.Set("Content-Type", "application/json")
 	loginRec := httptest.NewRecorder()
@@ -2454,8 +3052,8 @@ func TestUpdatePage_InvalidProperties(t *testing.T) {
 		gotFields[field.Field] = field.Message
 	}
 
-	if gotFields["properties.leafwiki_hidden"] != "Property key uses a reserved prefix" {
-		t.Fatalf("expected reserved prefix validation error, got %#v", gotFields)
+	if gotFields["properties.leafwiki_hidden"] != "Property key is reserved" {
+		t.Fatalf("expected reserved key validation error, got %#v", gotFields)
 	}
 }
 
@@ -2681,7 +3279,7 @@ func TestGetPagePermalinkEndpoint_PublicAccessAllowsUnauthenticatedReads(t *test
 	w := createWikiTestInstance(t)
 	defer test_utils.WrapCloseWithErrorCheck(w.Close, t)
 	router := httpinternal.NewRouter(w.Registrars(), w.FrontendConfig(), httpinternal.RouterOptions{
-		PublicAccess:            true,
+		PublicAccess:            publicaccess.NewEnvManaged(true),
 		InjectCodeInHeader:      "",
 		CustomStylesheet:        "",
 		AllowInsecure:           true,
@@ -2706,6 +3304,258 @@ func TestGetPagePermalinkEndpoint_PublicAccessAllowsUnauthenticatedReads(t *test
 	}
 	if target.Path != "public-page" {
 		t.Fatalf("expected path public-page, got %q", target.Path)
+	}
+}
+
+// TestReadRouteAccessMatrix pins the PR-2 refactor that collapsed the
+// per-domain "public group vs authed group" fork into a single group gated by
+// RequireAuthOrPublicRead. It asserts the auth *decision* (401 vs. not) for
+// every read endpoint that used to be duplicated, across public on/off and
+// anonymous/authenticated — without depending on seeded business data.
+func TestReadRouteAccessMatrix(t *testing.T) {
+	buildRouter := func(t *testing.T, public bool) (*gin.Engine, *wiki.Wiki) {
+		t.Helper()
+		w := createWikiTestInstance(t)
+		t.Cleanup(func() { test_utils.WrapCloseWithErrorCheck(w.Close, t) })
+		router := httpinternal.NewRouter(w.Registrars(), w.FrontendConfig(), httpinternal.RouterOptions{
+			PublicAccess:            publicaccess.NewEnvManaged(public),
+			AllowInsecure:           true,
+			AccessTokenTimeout:      15 * time.Minute,
+			RefreshTokenTimeout:     7 * 24 * time.Hour,
+			MaxAssetUploadSizeBytes: assets.DefaultMaxUploadSizeBytes,
+		})
+		return router, w
+	}
+
+	// Every read endpoint that had a public/authed duplication before PR 2.
+	// A bogus :id is fine — we only care that the auth gate, not the handler,
+	// decides the outcome.
+	readPaths := []string{
+		"/api/tree",
+		"/api/pages/bogus-id",
+		"/api/pages/by-path?path=whatever",
+		"/api/pages/by-title?title=whatever",
+		"/api/pages/lookup?path=whatever",
+		"/api/pages/permalink/bogus-id",
+		"/api/pages/bogus-id/links",
+		"/api/pages/bogus-id/assets",
+		"/api/search?q=whatever",
+		"/api/search/status",
+		"/api/tags",
+		"/api/tags/pages?tags=whatever",
+		"/api/properties",
+		"/api/properties/pages?key=k&value=v",
+		"/assets/whatever.txt",
+	}
+
+	get := func(router http.Handler, path string, cookies []*http.Cookie) int {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		for _, c := range cookies {
+			req.AddCookie(c)
+		}
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		return rec.Code
+	}
+
+	t.Run("PublicOff_Anonymous_Every401", func(t *testing.T) {
+		router, _ := buildRouter(t, false)
+		for _, p := range readPaths {
+			if code := get(router, p, nil); code != http.StatusUnauthorized {
+				t.Errorf("GET %s (public off, anon): want 401, got %d", p, code)
+			}
+		}
+	})
+
+	t.Run("PublicOn_Anonymous_Never401", func(t *testing.T) {
+		router, _ := buildRouter(t, true)
+		for _, p := range readPaths {
+			if code := get(router, p, nil); code == http.StatusUnauthorized {
+				t.Errorf("GET %s (public on, anon): want a non-401 business code, got 401", p)
+			}
+		}
+	})
+
+	for _, public := range []bool{false, true} {
+		public := public
+		t.Run(fmt.Sprintf("Public%v_Authenticated_Never401", public), func(t *testing.T) {
+			router, _ := buildRouter(t, public)
+			_, cookies := loginAdminAndGetCSRF(t, router)
+			for _, p := range readPaths {
+				if code := get(router, p, cookies); code == http.StatusUnauthorized {
+					t.Errorf("GET %s (public=%v, authed): want a non-401 business code, got 401", p, public)
+				}
+			}
+		})
+	}
+
+	// The collapse must not have loosened writes: an unauthenticated POST is
+	// still rejected (401 missing auth, or 403 missing CSRF) in both modes.
+	for _, public := range []bool{false, true} {
+		public := public
+		t.Run(fmt.Sprintf("Public%v_AnonymousWrite_StillRejected", public), func(t *testing.T) {
+			router, _ := buildRouter(t, public)
+			req := httptest.NewRequest(http.MethodPost, "/api/pages", strings.NewReader(`{"title":"x","slug":"x","parentId":"root"}`))
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, req)
+			if rec.Code != http.StatusUnauthorized && rec.Code != http.StatusForbidden {
+				t.Errorf("POST /api/pages (public=%v, anon): want 401/403, got %d", public, rec.Code)
+			}
+		})
+	}
+}
+
+// routerWithPublicAccess wires the instance-settings registrar (the runtime
+// public-mode toggle endpoint) into a test router, with the same
+// publicaccess.Service backing both the toggle and the read-route gate.
+func routerWithPublicAccess(t *testing.T, w *wiki.Wiki, svc *publicaccess.Service) *gin.Engine {
+	t.Helper()
+	w.SetInstanceSettingsRoutes(wikiinstancesettings.NewRoutes(svc, w.AuthService(), slog.Default()))
+	return httpinternal.NewRouter(w.Registrars(), w.FrontendConfig(), httpinternal.RouterOptions{
+		PublicAccess:            svc,
+		AllowInsecure:           true,
+		AccessTokenTimeout:      15 * time.Minute,
+		RefreshTokenTimeout:     7 * 24 * time.Hour,
+		MaxAssetUploadSizeBytes: assets.DefaultMaxUploadSizeBytes,
+	})
+}
+
+func anonStatus(router http.Handler, method, path string) int {
+	req := httptest.NewRequest(method, path, nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	return rec.Code
+}
+
+// TestPublicAccessToggle_SettingsManaged_FlipsReadAccessOnTheSameEngine is the
+// "no restart" regression pin: one *gin.Engine, an anonymous GET /api/tree
+// goes 401 → 200 → 401 as the toggle endpoint is called.
+func TestPublicAccessToggle_SettingsManaged_FlipsReadAccessOnTheSameEngine(t *testing.T) {
+	w := createWikiTestInstance(t)
+	defer test_utils.WrapCloseWithErrorCheck(w.Close, t)
+	svc, err := publicaccess.NewSettingsManaged(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewSettingsManaged: %v", err)
+	}
+	router := routerWithPublicAccess(t, w, svc)
+
+	if code := anonStatus(router, http.MethodGet, "/api/tree"); code != http.StatusUnauthorized {
+		t.Fatalf("before toggle: want 401, got %d", code)
+	}
+
+	rec := authenticatedRequest(t, router, http.MethodPut, "/api/admin/settings/public-access", strings.NewReader(`{"enabled":true}`))
+	if rec.Code != http.StatusOK || rec.Body.String() != `{"enabled":true}` {
+		t.Fatalf("enable: want 200 {\"enabled\":true}, got %d %s", rec.Code, rec.Body.String())
+	}
+
+	if code := anonStatus(router, http.MethodGet, "/api/tree"); code != http.StatusOK {
+		t.Fatalf("after enable: want 200 on the same engine, got %d", code)
+	}
+
+	rec = authenticatedRequest(t, router, http.MethodPut, "/api/admin/settings/public-access", strings.NewReader(`{"enabled":false}`))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("disable: want 200, got %d %s", rec.Code, rec.Body.String())
+	}
+
+	if code := anonStatus(router, http.MethodGet, "/api/tree"); code != http.StatusUnauthorized {
+		t.Fatalf("after disable: want 401 again, got %d", code)
+	}
+}
+
+func TestPublicAccessToggle_ConfigEndpointReflectsTheChange(t *testing.T) {
+	w := createWikiTestInstance(t)
+	defer test_utils.WrapCloseWithErrorCheck(w.Close, t)
+	svc, err := publicaccess.NewSettingsManaged(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewSettingsManaged: %v", err)
+	}
+	router := routerWithPublicAccess(t, w, svc)
+
+	readConfig := func() map[string]any {
+		req := httptest.NewRequest(http.MethodGet, "/api/config", nil)
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET /api/config: %d", rec.Code)
+		}
+		var m map[string]any
+		if err := json.Unmarshal(rec.Body.Bytes(), &m); err != nil {
+			t.Fatalf("decode /api/config: %v", err)
+		}
+		return m
+	}
+
+	cfg := readConfig()
+	if cfg["publicAccess"] != false || cfg["publicAccessEnvManaged"] != false {
+		t.Fatalf("initial config: want publicAccess=false envManaged=false, got %v / %v", cfg["publicAccess"], cfg["publicAccessEnvManaged"])
+	}
+
+	rec := authenticatedRequest(t, router, http.MethodPut, "/api/admin/settings/public-access", strings.NewReader(`{"enabled":true}`))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("enable: %d %s", rec.Code, rec.Body.String())
+	}
+
+	if cfg := readConfig(); cfg["publicAccess"] != true {
+		t.Fatalf("after enable: want publicAccess=true, got %v", cfg["publicAccess"])
+	}
+}
+
+func TestPublicAccessToggle_EnvManaged_Returns409AndDoesNotChange(t *testing.T) {
+	w := createWikiTestInstance(t)
+	defer test_utils.WrapCloseWithErrorCheck(w.Close, t)
+	svc := publicaccess.NewEnvManaged(false)
+	router := routerWithPublicAccess(t, w, svc)
+
+	rec := authenticatedRequest(t, router, http.MethodPut, "/api/admin/settings/public-access", strings.NewReader(`{"enabled":true}`))
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("want 409 for env-managed, got %d %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), publicaccess.ErrCodeEnvManaged) {
+		t.Fatalf("want error code %q in body, got %s", publicaccess.ErrCodeEnvManaged, rec.Body.String())
+	}
+	if code := anonStatus(router, http.MethodGet, "/api/tree"); code != http.StatusUnauthorized {
+		t.Fatalf("env-managed stayed off, but anon tree is %d", code)
+	}
+}
+
+func TestPublicAccessToggle_RequiresAdmin(t *testing.T) {
+	w := createWikiTestInstance(t)
+	defer test_utils.WrapCloseWithErrorCheck(w.Close, t)
+	svc, err := publicaccess.NewSettingsManaged(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewSettingsManaged: %v", err)
+	}
+	router := routerWithPublicAccess(t, w, svc)
+
+	// Anonymous → 401.
+	if code := anonStatus(router, http.MethodPut, "/api/admin/settings/public-access"); code != http.StatusUnauthorized {
+		t.Fatalf("anon PUT: want 401, got %d", code)
+	}
+
+	// Editor → 403.
+	authenticatedRequest(t, router, http.MethodPost, "/api/users",
+		strings.NewReader(`{"username":"ed","email":"ed@example.com","password":"editorpass","role":"editor"}`))
+	rec := authenticatedRequestAs(t, router, "ed", "editorpass", http.MethodPut, "/api/admin/settings/public-access", strings.NewReader(`{"enabled":true}`))
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("editor PUT: want 403, got %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestPublicAccessToggle_BadPayload_Returns400(t *testing.T) {
+	w := createWikiTestInstance(t)
+	defer test_utils.WrapCloseWithErrorCheck(w.Close, t)
+	svc, err := publicaccess.NewSettingsManaged(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewSettingsManaged: %v", err)
+	}
+	router := routerWithPublicAccess(t, w, svc)
+
+	for _, body := range []string{`{}`, `{"enabled":"yes"}`, `not json`} {
+		rec := authenticatedRequest(t, router, http.MethodPut, "/api/admin/settings/public-access", strings.NewReader(body))
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("payload %q: want 400, got %d %s", body, rec.Code, rec.Body.String())
+		}
 	}
 }
 
@@ -2888,7 +3738,7 @@ func TestAuthLoginEndpoint(t *testing.T) {
 	defer test_utils.WrapCloseWithErrorCheck(w.Close, t)
 	router := createRouterTestInstance(w, t)
 
-	body := `{"identifier": "admin", "password": "admin"}`
+	body := `{"identifier": "admin", "password": "adminpassword"}`
 	req := httptest.NewRequest(http.MethodPost, "/api/auth/login", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
@@ -2936,7 +3786,7 @@ func TestAuthRefreshToken(t *testing.T) {
 	}
 
 	// 1) Login
-	loginBody := `{"identifier": "admin", "password": "admin"}`
+	loginBody := `{"identifier": "admin", "password": "adminpassword"}`
 	loginReq := httptest.NewRequest(http.MethodPost, "/api/auth/login", strings.NewReader(loginBody))
 	loginReq.Header.Set("Content-Type", "application/json")
 	loginRec := httptest.NewRecorder()
@@ -3185,6 +4035,53 @@ func TestViewer_CannotDeletePage(t *testing.T) {
 	}
 }
 
+func TestViewer_CannotMovePage(t *testing.T) {
+	w := createWikiTestInstance(t)
+	defer test_utils.WrapCloseWithErrorCheck(w.Close, t)
+	router := createRouterTestInstance(w, t)
+
+	// Create a viewer user
+	createUserBody := `{"username": "vieweruser5", "email": "viewer5@example.com", "password": "viewerpass5", "role": "viewer"}`
+	authenticatedRequest(t, router, http.MethodPost, "/api/users", strings.NewReader(createUserBody))
+
+	// Create two pages as admin
+	a := createPageViaAPI(t, router, "Section A", "section-a", nil, pageNodeKind())
+	b := createPageViaAPI(t, router, "Section B", "section-b", nil, pageNodeKind())
+
+	// Try to move a under b as viewer
+	rec := authenticatedRequestAs(t, router, "vieweruser5", "viewerpass5", http.MethodPut, "/api/pages/"+a.ID+"/move", strings.NewReader(`{"version":"`+a.Version+`","parentId":"`+b.ID+`"}`))
+
+	if rec.Code != http.StatusForbidden {
+		t.Errorf("Expected 403 Forbidden for viewer moving page, got %d", rec.Code)
+	}
+}
+
+func TestViewer_CannotSortPages(t *testing.T) {
+	w := createWikiTestInstance(t)
+	defer test_utils.WrapCloseWithErrorCheck(w.Close, t)
+	router := createRouterTestInstance(w, t)
+
+	// Create a viewer user
+	createUserBody := `{"username": "vieweruser6", "email": "viewer6@example.com", "password": "viewerpass6", "role": "viewer"}`
+	authenticatedRequest(t, router, http.MethodPost, "/api/users", strings.NewReader(createUserBody))
+
+	// Create pages as admin
+	page1 := createPageViaAPI(t, router, "Page 1", "page-1", nil, pageNodeKind())
+	page2 := createPageViaAPI(t, router, "Page 2", "page-2", nil, pageNodeKind())
+
+	// Try to sort pages as viewer
+	payload := map[string]interface{}{
+		"orderedIds": []string{page2.ID, page1.ID},
+	}
+	body, _ := json.Marshal(payload)
+
+	rec := authenticatedRequestAs(t, router, "vieweruser6", "viewerpass6", http.MethodPut, "/api/pages/root/sort", strings.NewReader(string(body)))
+
+	if rec.Code != http.StatusForbidden {
+		t.Errorf("Expected 403 Forbidden for viewer sorting pages, got %d", rec.Code)
+	}
+}
+
 func TestGetUsersEndpoint(t *testing.T) {
 	w := createWikiTestInstance(t)
 	defer test_utils.WrapCloseWithErrorCheck(w.Close, t)
@@ -3343,7 +4240,7 @@ func TestRequireAdminMiddleware_BlockedWhenAuthDisabled(t *testing.T) {
 
 	// Create router with auth disabled
 	router := httpinternal.NewRouter(w.Registrars(), w.FrontendConfig(), httpinternal.RouterOptions{
-		PublicAccess:            false,
+		PublicAccess:            publicaccess.NewEnvManaged(false),
 		InjectCodeInHeader:      "",
 		AllowInsecure:           true,
 		AccessTokenTimeout:      15 * time.Minute,
@@ -3422,7 +4319,7 @@ func TestAssetEndpoints(t *testing.T) {
 	router := createRouterTestInstance(w, t)
 
 	// Step 0: Login als Admin und Cookies holen
-	loginBody := `{"identifier": "admin", "password": "admin"}`
+	loginBody := `{"identifier": "admin", "password": "adminpassword"}`
 	loginReq := httptest.NewRequest(http.MethodPost, "/api/auth/login", strings.NewReader(loginBody))
 	loginReq.Header.Set("Content-Type", "application/json")
 	loginRec := httptest.NewRecorder()
@@ -3558,7 +4455,7 @@ func TestAssetMutationRevisionsUseAuthenticatedUser(t *testing.T) {
 	router := createRouterTestInstanceWithRevision(w, t)
 	adminUserID := getAdminUserIDViaAPI(t, router)
 
-	loginBody := `{"identifier": "admin", "password": "admin"}`
+	loginBody := `{"identifier": "admin", "password": "adminpassword"}`
 	loginReq := httptest.NewRequest(http.MethodPost, "/api/auth/login", strings.NewReader(loginBody))
 	loginReq.Header.Set("Content-Type", "application/json")
 	loginRec := httptest.NewRecorder()
@@ -3744,7 +4641,7 @@ func uploadTestAsset(t *testing.T, router *gin.Engine, w *wiki.Wiki, content str
 
 	if needsAuth {
 		// Login to get auth cookies
-		loginBody := `{"identifier": "admin", "password": "admin"}`
+		loginBody := `{"identifier": "admin", "password": "adminpassword"}`
 		loginReq := httptest.NewRequest(http.MethodPost, "/api/auth/login", strings.NewReader(loginBody))
 		loginReq.Header.Set("Content-Type", "application/json")
 		loginRec := httptest.NewRecorder()
@@ -3840,7 +4737,7 @@ func TestAssetAccessControl(t *testing.T) {
 
 		// Create router with PublicAccess=false and AuthDisabled=false
 		router := httpinternal.NewRouter(w.Registrars(), w.FrontendConfig(), httpinternal.RouterOptions{
-			PublicAccess:            false,
+			PublicAccess:            publicaccess.NewEnvManaged(false),
 			InjectCodeInHeader:      "",
 			CustomStylesheet:        "",
 			AllowInsecure:           true,
@@ -3870,7 +4767,7 @@ func TestAssetAccessControl(t *testing.T) {
 
 		// Create router with PublicAccess=false and AuthDisabled=false
 		router := httpinternal.NewRouter(w.Registrars(), w.FrontendConfig(), httpinternal.RouterOptions{
-			PublicAccess:            false,
+			PublicAccess:            publicaccess.NewEnvManaged(false),
 			InjectCodeInHeader:      "",
 			CustomStylesheet:        "",
 			AllowInsecure:           true,
@@ -3909,7 +4806,7 @@ func TestAssetAccessControl(t *testing.T) {
 
 		// Create router with PublicAccess=true
 		router := httpinternal.NewRouter(w.Registrars(), w.FrontendConfig(), httpinternal.RouterOptions{
-			PublicAccess:            true,
+			PublicAccess:            publicaccess.NewEnvManaged(true),
 			InjectCodeInHeader:      "",
 			CustomStylesheet:        "",
 			AllowInsecure:           true,
@@ -3945,7 +4842,7 @@ func TestAssetAccessControl(t *testing.T) {
 
 		// Create router with AuthDisabled=true
 		router := httpinternal.NewRouter(w.Registrars(), w.FrontendConfig(), httpinternal.RouterOptions{
-			PublicAccess:            false,
+			PublicAccess:            publicaccess.NewEnvManaged(false),
 			InjectCodeInHeader:      "",
 			CustomStylesheet:        "",
 			AllowInsecure:           true,
@@ -4051,7 +4948,7 @@ func TestCustomStylesheetRoute(t *testing.T) {
 	}
 
 	router := httpinternal.NewRouter(w.Registrars(), w.FrontendConfig(), httpinternal.RouterOptions{
-		PublicAccess:            false,
+		PublicAccess:            publicaccess.NewEnvManaged(false),
 		InjectCodeInHeader:      "",
 		CustomStylesheet:        customCSSPath,
 		AllowInsecure:           true,
@@ -4088,7 +4985,7 @@ func TestCustomStylesheetRoute_RejectsPathOutsideStorageDir(t *testing.T) {
 	}
 
 	router := httpinternal.NewRouter(w.Registrars(), w.FrontendConfig(), httpinternal.RouterOptions{
-		PublicAccess:            false,
+		PublicAccess:            publicaccess.NewEnvManaged(false),
 		InjectCodeInHeader:      "",
 		CustomStylesheet:        outsideCSSPath,
 		AllowInsecure:           true,
@@ -4117,7 +5014,7 @@ func TestCustomStylesheetRoute_RejectsNonCSSFile(t *testing.T) {
 	}
 
 	router := httpinternal.NewRouter(w.Registrars(), w.FrontendConfig(), httpinternal.RouterOptions{
-		PublicAccess:            false,
+		PublicAccess:            publicaccess.NewEnvManaged(false),
 		InjectCodeInHeader:      "",
 		CustomStylesheet:        textFilePath,
 		AllowInsecure:           true,
@@ -4167,7 +5064,7 @@ func TestFaviconRoute_DisablesClientCache(t *testing.T) {
 	}()
 
 	router := httpinternal.NewRouter(w.Registrars(), w.FrontendConfig(), httpinternal.RouterOptions{
-		PublicAccess:            false,
+		PublicAccess:            publicaccess.NewEnvManaged(false),
 		InjectCodeInHeader:      "",
 		CustomStylesheet:        "",
 		AllowInsecure:           true,
@@ -4241,5 +5138,44 @@ func TestBuildCustomStylesheetTag_WhitespacePath(t *testing.T) {
 	tag := httpinternal.BuildCustomStylesheetTag("/wiki", "   ")
 	if tag != "" {
 		t.Fatalf("expected empty tag for whitespace path, got %q", tag)
+	}
+}
+
+func TestBrokenLinksEndpoint_AdminGetsLinksArray(t *testing.T) {
+	w := createWikiTestInstance(t)
+	defer test_utils.WrapCloseWithErrorCheck(w.Close, t)
+	router := createRouterTestInstance(w, t)
+
+	rec := authenticatedRequest(t, router, http.MethodGet, "/api/links/broken", nil)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for admin, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var resp struct {
+		Links []map[string]any `json:"links"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("invalid JSON response: %v", err)
+	}
+	if resp.Links == nil {
+		t.Errorf("expected a (possibly empty) links array, got null")
+	}
+}
+
+func TestBrokenLinksEndpoint_ViewerForbidden(t *testing.T) {
+	w := createWikiTestInstance(t)
+	defer test_utils.WrapCloseWithErrorCheck(w.Close, t)
+	router := createRouterTestInstance(w, t)
+
+	// The broken-links audit is admin-only maintenance data — a non-admin
+	// authenticated user must not be able to enumerate it.
+	createUserBody := `{"username": "vieweruser", "email": "viewer@example.com", "password": "viewerpass", "role": "viewer"}`
+	authenticatedRequest(t, router, http.MethodPost, "/api/users", strings.NewReader(createUserBody))
+
+	rec := authenticatedRequestAs(t, router, "vieweruser", "viewerpass", http.MethodGet, "/api/links/broken", nil)
+
+	if rec.Code != http.StatusForbidden {
+		t.Errorf("expected 403 for viewer, got %d: %s", rec.Code, rec.Body.String())
 	}
 }

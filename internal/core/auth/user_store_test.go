@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	sharederrors "github.com/perber/wiki/internal/core/shared/errors"
 	"github.com/perber/wiki/internal/test_utils"
 )
 
@@ -26,6 +27,62 @@ func setupTestUserStore(t *testing.T) *UserStore {
 		t.Fatalf("Failed to create user store: %v", err)
 	}
 	return userStore
+}
+
+func TestUserStore_UsesWALJournalMode(t *testing.T) {
+	userStore := setupTestUserStore(t)
+	defer test_utils.WrapCloseWithErrorCheck(userStore.Close, t)
+
+	if err := userStore.Connect(); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+
+	var mode string
+	if err := userStore.db.QueryRow(`PRAGMA journal_mode`).Scan(&mode); err != nil {
+		t.Fatalf("failed to read journal_mode: %v", err)
+	}
+	if !strings.EqualFold(mode, "wal") {
+		t.Fatalf("journal_mode = %q, want %q", mode, "wal")
+	}
+}
+
+// Pins the invariant restore's live-swap path depends on: UserStore.suspend
+// (which this test approximates via the exported Close) must leave users.db
+// self-consistent on its own, since restore/swap.go's removeStaleWALSidecars
+// deletes any leftover -wal/-shm before a fresh store reopens the file — if
+// WAL content weren't checkpointed into the main file on close, that data
+// would be silently lost the moment the sidecar is removed.
+func TestUserStore_DataSurvivesCloseAndFreshReopen(t *testing.T) {
+	storageDir := t.TempDir()
+	userStore, err := NewUserStore(storageDir)
+	if err != nil {
+		t.Fatalf("NewUserStore: %v", err)
+	}
+
+	user := &User{ID: "u1", Username: "alice", Password: "hash", Email: "alice@example.com", Role: RoleEditor}
+	if err := userStore.CreateUser(user); err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+
+	if err := userStore.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Same sequence AuthService.ReplaceUserStore follows after a restore
+	// swap: a brand new UserStore over the same storage dir.
+	reopened, err := NewUserStore(storageDir)
+	if err != nil {
+		t.Fatalf("NewUserStore (reopen): %v", err)
+	}
+	defer test_utils.WrapCloseWithErrorCheck(reopened.Close, t)
+
+	got, err := reopened.GetUserByID("u1")
+	if err != nil {
+		t.Fatalf("GetUserByID after close+reopen: %v", err)
+	}
+	if got.Username != "alice" {
+		t.Fatalf("Username = %q, want alice", got.Username)
+	}
 }
 
 func TestUserStore_CreatesDatabaseInStorageDir(t *testing.T) {
@@ -648,4 +705,51 @@ func TestUserStoreUpdatePassword(t *testing.T) {
 		t.Errorf("Expected password %s, got %s", "newpassword", retrievedUser.Password)
 	}
 
+}
+
+// TestUserStore_Suspend_ClosesDBAndBlocksReconnect is the regression test for
+// the root cause of the Windows live-restore bug: a plain Close() lets the
+// very next query silently reopen a new *sql.DB (Connect() reopens whenever
+// f.db is nil), which would race a reconnect against restore.SwapAll's
+// os.Rename of users.db. suspend() must close the connection AND make
+// Connect() refuse to reopen it, so a query landing during the swap window
+// fails fast instead of grabbing a fresh OS-level file handle.
+func TestUserStore_Suspend_ClosesDBAndBlocksReconnect(t *testing.T) {
+	store := setupTestUserStore(t)
+
+	user := &User{
+		ID:       "1",
+		Username: "suspend-test-user",
+		Password: "password1",
+		Email:    "suspend-test-user@example.com",
+		Role:     "admin",
+	}
+	if err := store.CreateUser(user); err != nil {
+		t.Fatalf("CreateUser failed: %v", err)
+	}
+
+	if err := store.suspend(); err != nil {
+		t.Fatalf("suspend failed: %v", err)
+	}
+	if store.db != nil {
+		t.Fatal("expected db to be nil immediately after suspend")
+	}
+
+	_, err := store.GetUserByUsername("suspend-test-user")
+	if err == nil {
+		t.Fatal("expected a query against a suspended store to fail, not silently reconnect")
+	}
+	localized, ok := sharederrors.AsLocalizedError(err)
+	if !ok || localized.Code != "auth_user_store_unavailable" {
+		t.Fatalf("expected auth_user_store_unavailable, got %v", err)
+	}
+	if store.db != nil {
+		t.Fatal("expected the failed query to NOT have reopened db — that's exactly the race this fix prevents")
+	}
+
+	// suspend must be idempotent — Manager.rollbackOrIntervene's cleanup
+	// paths may end up calling code that touches an already-suspended store.
+	if err := store.suspend(); err != nil {
+		t.Fatalf("expected a second suspend call to be a safe no-op, got: %v", err)
+	}
 }

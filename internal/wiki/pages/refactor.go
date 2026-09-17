@@ -5,10 +5,13 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"strings"
+	"time"
 
 	"github.com/perber/wiki/internal/core/revision"
 	sharederrors "github.com/perber/wiki/internal/core/shared/errors"
 	"github.com/perber/wiki/internal/core/tree"
+	httpmetrics "github.com/perber/wiki/internal/http/metrics"
 	"github.com/perber/wiki/internal/links"
 	"github.com/perber/wiki/internal/wiki/pagesave"
 )
@@ -60,6 +63,8 @@ type RefactorApplyInput struct {
 	Version string
 	RefactorPreviewInput
 	RewriteLinks bool
+	// Position is the target sibling index for RefactorKindMove; nil appends at the end.
+	Position *int
 }
 
 // PreviewPageRefactorUseCase computes what would change if a refactor is applied.
@@ -297,6 +302,7 @@ type ApplyPageRefactorUseCase struct {
 	links    *links.LinkService
 	log      *slog.Logger
 	preview  *PreviewPageRefactorUseCase
+	metrics  *httpmetrics.HTTPMetrics
 }
 
 // NewApplyPageRefactorUseCase constructs an ApplyPageRefactorUseCase.
@@ -306,6 +312,7 @@ func NewApplyPageRefactorUseCase(
 	r *revision.Service,
 	l *links.LinkService,
 	log *slog.Logger,
+	metrics *httpmetrics.HTTPMetrics,
 ) *ApplyPageRefactorUseCase {
 	return &ApplyPageRefactorUseCase{
 		tree:     t,
@@ -314,11 +321,13 @@ func NewApplyPageRefactorUseCase(
 		links:    l,
 		log:      log,
 		preview:  NewPreviewPageRefactorUseCase(t, s, l, log),
+		metrics:  metrics,
 	}
 }
 
 // Execute applies the refactor operation to the page tree.
 func (uc *ApplyPageRefactorUseCase) Execute(ctx context.Context, in RefactorApplyInput) (*tree.Page, error) {
+	started := time.Now()
 	plan, err := uc.buildApplyPlan(in)
 	if err != nil {
 		return nil, err
@@ -335,19 +344,24 @@ func (uc *ApplyPageRefactorUseCase) Execute(ctx context.Context, in RefactorAppl
 			rule.OldTitle = plan.page.Title
 			rule.NewTitle = in.Title
 		}
-		if err := uc.rewriteAffectedPages(in.UserID, plan.affectedPageIDs, []links.RewriteRule{rule}); err != nil {
+		stepStarted := time.Now()
+		err := uc.rewriteAffectedPages(in.UserID, plan.affectedPageIDs, []links.RewriteRule{rule})
+		uc.metrics.ObserveRefactorStep(in.Kind, "rewrite_affected_pages", stepStarted)
+		if err != nil {
 			return nil, err
 		}
 	}
 
 	o := pagesave.NewPageSaveOrchestrator(
-		pagesave.NewLinkIndexSideEffect(uc.links, uc.log),
-		pagesave.NewRevisionSideEffect(uc.revision, uc.log),
+		uc.metrics,
+		pagesave.NewLinkIndexSideEffect(uc.links, uc.log, uc.metrics),
+		pagesave.NewRevisionSideEffect(uc.revision, uc.log, uc.metrics),
 	)
 
 	switch in.Kind {
 	case RefactorKindRename:
-		updateUC := NewUpdatePageUseCase(uc.tree, uc.slug, o, uc.log)
+		updateStepStarted := time.Now()
+		updateUC := NewUpdatePageUseCase(uc.tree, uc.slug, o, uc.log, uc.metrics)
 		updated, err := updateUC.Execute(ctx, UpdatePageInput{
 			UserID:  in.UserID,
 			ID:      in.PageID,
@@ -357,37 +371,61 @@ func (uc *ApplyPageRefactorUseCase) Execute(ctx context.Context, in RefactorAppl
 			Content: in.Content,
 			Kind:    kindPage(),
 		})
+		uc.metrics.ObserveRefactorStep(in.Kind, "update_target_page", updateStepStarted)
 		if err != nil {
 			return nil, err
 		}
-		if err := uc.rewritePathChangedSubtree(in.UserID, snapshots, plan.oldPath, plan.newPath); err != nil {
+		subtreeStepStarted := time.Now()
+		err = uc.rewritePathChangedSubtree(in.UserID, snapshots, plan.oldPath, plan.newPath)
+		uc.metrics.ObserveRefactorStep(in.Kind, "rewrite_path_changed_subtree", subtreeStepStarted)
+		if err != nil {
 			return nil, err
 		}
 		if in.RewriteLinks {
-			if err := uc.refreshAffectedPageLinks(plan.affectedPageIDs); err != nil {
+			refreshStepStarted := time.Now()
+			err := uc.refreshAffectedPageLinks(plan.affectedPageIDs)
+			uc.metrics.ObserveRefactorStep(in.Kind, "refresh_affected_links", refreshStepStarted)
+			if err != nil {
 				return nil, err
 			}
 		}
-		return uc.tree.GetPage(updated.Page.ID)
+		page, err := uc.tree.GetPage(updated.Page.ID)
+		if err == nil {
+			uc.metrics.ObserveRefactor(in.Kind, in.RewriteLinks, plan.affectedPages, plan.matchedLinks, started)
+		}
+		return page, err
 
 	case RefactorKindMove:
 		parentID := ""
 		if in.NewParentID != nil {
 			parentID = *in.NewParentID
 		}
-		moveUC := NewMovePageUseCase(uc.tree, o, uc.log)
-		if err := moveUC.Execute(ctx, MovePageInput{UserID: in.UserID, ID: in.PageID, Version: in.Version, ParentID: parentID}); err != nil {
+		moveStepStarted := time.Now()
+		moveUC := NewMovePageUseCase(uc.tree, o, uc.log, uc.metrics)
+		err := moveUC.Execute(ctx, MovePageInput{UserID: in.UserID, ID: in.PageID, Version: in.Version, ParentID: parentID, Position: in.Position})
+		uc.metrics.ObserveRefactorStep(in.Kind, "move_target_page", moveStepStarted)
+		if err != nil {
 			return nil, err
 		}
-		if err := uc.rewritePathChangedSubtree(in.UserID, snapshots, plan.oldPath, plan.newPath); err != nil {
+		subtreeStepStarted := time.Now()
+		err = uc.rewritePathChangedSubtree(in.UserID, snapshots, plan.oldPath, plan.newPath)
+		uc.metrics.ObserveRefactorStep(in.Kind, "rewrite_path_changed_subtree", subtreeStepStarted)
+		if err != nil {
 			return nil, err
 		}
 		if in.RewriteLinks {
-			if err := uc.refreshAffectedPageLinks(plan.affectedPageIDs); err != nil {
+			refreshStepStarted := time.Now()
+			err := uc.refreshAffectedPageLinks(plan.affectedPageIDs)
+			uc.metrics.ObserveRefactorStep(in.Kind, "refresh_affected_links", refreshStepStarted)
+			if err != nil {
 				return nil, err
 			}
 		}
-		return uc.tree.GetPage(in.PageID)
+		page, err := uc.tree.GetPage(in.PageID)
+		if err == nil {
+			uc.metrics.ObserveRefactor(in.Kind, in.RewriteLinks, plan.affectedPages, plan.matchedLinks, started)
+		}
+		return page, err
 
 	default:
 		return nil, fmt.Errorf("unsupported refactor kind: %s", in.Kind)
@@ -399,6 +437,8 @@ type applyRefactorPlan struct {
 	oldPath         string
 	newPath         string
 	affectedPageIDs []string
+	affectedPages   int
+	matchedLinks    int
 }
 
 func (uc *ApplyPageRefactorUseCase) buildApplyPlan(in RefactorApplyInput) (*applyRefactorPlan, error) {
@@ -422,6 +462,13 @@ func (uc *ApplyPageRefactorUseCase) buildApplyPlan(in RefactorApplyInput) (*appl
 	if !in.RewriteLinks || uc.links == nil {
 		return plan, nil
 	}
+
+	affectedPages, matchedLinks, err := uc.preview.getAffectedPages(oldPath, page.Title, subtreeIDSet(page.PageNode), sentinelTitleForRefactor(page, in))
+	if err != nil {
+		return nil, err
+	}
+	plan.affectedPages = len(affectedPages)
+	plan.matchedLinks = matchedLinks
 
 	pageIDs, err := uc.links.GetRefactorSourcePageIDsForPrefix(oldPath)
 	if err != nil {
@@ -462,6 +509,13 @@ func (uc *ApplyPageRefactorUseCase) buildApplyPlan(in RefactorApplyInput) (*appl
 	}
 
 	return plan, nil
+}
+
+func sentinelTitleForRefactor(page *tree.Page, in RefactorApplyInput) string {
+	if in.Kind == RefactorKindRename && in.Title != page.Title {
+		return page.Title
+	}
+	return ""
 }
 
 type pathChangeSnapshot struct {
@@ -607,12 +661,23 @@ func (uc *ApplyPageRefactorUseCase) rewritePathChangedSubtree(userID string, sna
 		if !ok {
 			continue
 		}
-		result := engine.RewriteRelativeLinksForPathChange(snap.Content, snap.OldPath, current.CalculatePath(), rules)
-		if (result.Count() == 0 && snap.Content == current.Content) || result.Content == current.Content {
+		currentPath := current.CalculatePath()
+		// First, fix relative links whose base path changed because the page moved.
+		relResult := engine.RewriteRelativeLinksForPathChange(snap.Content, snap.OldPath, currentPath, rules)
+		// Then, fix absolute links within the moved subtree (e.g. /old/sub → /new/sub).
+		// RewriteRelativeLinksForPathChange skips absolute links, so they need a
+		// second pass. Using the new current path is safe here: relative links were
+		// already corrected in the first pass and will not match the old-path rules.
+		// Skip pass 2 when the content cannot contain any matching absolute links.
+		finalContent := relResult.Content
+		if strings.Contains(relResult.Content, oldPath) {
+			finalContent = engine.Rewrite(relResult.Content, currentPath, rules).Content
+		}
+		if finalContent == current.Content {
 			continue
 		}
-		items = append(items, pending{page: current, content: result.Content})
-		bulk = append(bulk, tree.BulkContentUpdate{ID: current.ID, Content: result.Content})
+		items = append(items, pending{page: current, content: finalContent})
+		bulk = append(bulk, tree.BulkContentUpdate{ID: current.ID, Content: finalContent})
 	}
 
 	if len(bulk) == 0 {

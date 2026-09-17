@@ -3,11 +3,13 @@ import { createLeafWikiRouter } from '@/features/router/router'
 import { useBootstrapAuth } from '@/lib/bootstrapAuth'
 import { BASE_PATH } from '@/lib/config'
 import { useIsReadOnly } from '@/lib/useIsReadOnly'
+import { useFavoritesStore } from '@/stores/favorites'
 import { useSessionStore } from '@/stores/session'
+import { useUserSettingsStore } from '@/stores/userSettings'
 import useApplyDesignMode from '@/useApplyDesignMode'
 import { Loader2 } from 'lucide-react'
 import { Suspense, useEffect, useLayoutEffect, useMemo, useRef } from 'react'
-import { RouterProvider } from 'react-router-dom'
+import { RouterProvider } from 'react-router/dom'
 import { toast, Toaster } from 'sonner'
 import './App.css'
 import { useBrandingStore } from './stores/branding'
@@ -19,6 +21,8 @@ function App() {
   const loadConfig = useConfigStore((s) => s.loadConfig)
   const authDisabled = useConfigStore((s) => s.authDisabled)
   const enableRevision = useConfigStore((s) => s.enableRevision)
+  const loginUrl = useConfigStore((s) => s.loginUrl)
+  const smtpEnabled = useConfigStore((s) => s.smtpEnabled)
   const loadBranding = useBrandingStore((s) => s.loadBranding)
   const lastConfigErrorRef = useRef<string | null>(null)
 
@@ -26,14 +30,40 @@ function App() {
   useBootstrapAuth(configHasLoaded && !authDisabled)
 
   const isLoggedIn = useSessionStore((s) => !!s.user)
+  const userId = useSessionStore((s) => s.user?.id ?? null)
   const isRefreshing = useSessionStore((s) => s.isRefreshing)
   const isReadOnly = useIsReadOnly()
   const isReadOnlyViewer = isReadOnly && !isLoggedIn
+  const loadFavorites = useFavoritesStore((s) => s.loadFavorites)
+  const clearFavorites = useFavoritesStore((s) => s.clearFavorites)
+  const loadUserSettings = useUserSettingsStore((s) => s.loadUserSettings)
+  const clearUserSettings = useUserSettingsStore((s) => s.clearUserSettings)
 
   useApplyDesignMode()
   useEffect(() => {
     loadConfig()
   }, [loadConfig])
+
+  // Favorites are per-user server truth — (re)load whenever the logged-in
+  // user changes, and clear them on logout so a second user on the same
+  // browser never sees the first user's favorites.
+  useEffect(() => {
+    if (userId) {
+      loadFavorites()
+    } else {
+      clearFavorites()
+    }
+  }, [userId, loadFavorites, clearFavorites])
+
+  // User settings (e.g. autoSave) are per-user server truth, just like
+  // favorites above — (re)load on login, reset on logout.
+  useEffect(() => {
+    if (userId) {
+      loadUserSettings()
+    } else {
+      clearUserSettings()
+    }
+  }, [userId, loadUserSettings, clearUserSettings])
 
   useLayoutEffect(() => {
     // Load branding configuration
@@ -58,9 +88,11 @@ function App() {
         isReadOnlyViewer,
         authDisabled,
         enableRevision,
+        loginUrl,
+        smtpEnabled,
         BASE_PATH || undefined,
       ),
-    [isReadOnlyViewer, authDisabled, enableRevision],
+    [isReadOnlyViewer, authDisabled, enableRevision, loginUrl, smtpEnabled],
   )
 
   return (
