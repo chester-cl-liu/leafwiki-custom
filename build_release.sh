@@ -5,9 +5,16 @@ set -e
 MODULE_NAME="leafwiki"
 # VERSION="0.13.02-custom"
 # 2. 自动提取当前 Git 标签作为版本号（如未打 Tag 则读取 package.json 或退回默认值）
-VERSION=$(git describe --tags --exact-match 2>/dev/null || \
-          node -p "require('./ui/leafwiki-ui/package.json').version" 2>/dev/null || \
-          echo "v0.13.0-custom")
+# VERSION=$(git describe --tags --exact-match 2>/dev/null || \
+#          node -p "require('./ui/leafwiki-ui/package.json').version" 2>/dev/null || \
+#          echo "v0.13.0-custom")
+# 自动提取当前 Git 标签（如未打 Tag 则读取 package.json 或退回默认值）
+RAW_VERSION=$(git describe --tags --exact-match 2>/dev/null || \
+              node -p "require('./ui/leafwiki-ui/package.json').version" 2>/dev/null || \
+              echo "0.13.0-custom")
+
+# 先剥离可能存在的 v，再统一强行补上 v 前缀（确保结果必为 v0.13.0-custom 格式）
+VERSION="v${RAW_VERSION#v}"
 BUILD_DIR="releases_dist"
 
 # ==== 1. 前端自动化打包与资源同步 ====
